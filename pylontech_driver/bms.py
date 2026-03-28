@@ -68,15 +68,15 @@ class BmsSnapshot:
     modules: list[ModuleData] = field(default_factory=list)
 
     # Stack-level aggregates (calculated from module data)
-    soc_pct: float = 0.0          # average across modules
-    soh_pct: float = 0.0          # average
-    soh_pct_min: float = 0.0      # worst module
+    soc_pct: float = 0.0  # average across modules
+    soh_pct: float = 0.0  # average
+    soh_pct_min: float = 0.0  # worst module
     cycle_count_avg: float = 0.0
-    cycle_count_max: int = 0       # highest cycled module
+    cycle_count_max: int = 0  # highest cycled module
 
     battery_voltage_v: float = 0.0  # average module voltage
     battery_current_a: float = 0.0  # sum (total pack current)
-    battery_power_w: float = 0.0    # derived: voltage × current
+    battery_power_w: float = 0.0  # derived: voltage × current
 
     cell_voltage_max_v: float = 0.0
     cell_voltage_min_v: float = 0.0
@@ -121,19 +121,35 @@ def _aggregate(modules: list[ModuleData]) -> BmsSnapshot:
         snap.cell_temp_min_c = min(all_temps)
 
     # BMS limits: use most restrictive (lowest charge limit, highest discharge limit)
-    cv_limits = [m.charge_voltage_limit_v for m in modules if m.charge_voltage_limit_v is not None]
+    cv_limits = [
+        m.charge_voltage_limit_v
+        for m in modules
+        if m.charge_voltage_limit_v is not None
+    ]
     if cv_limits:
         snap.charge_voltage_limit_v = min(cv_limits)
 
-    dv_limits = [m.discharge_voltage_limit_v for m in modules if m.discharge_voltage_limit_v is not None]
+    dv_limits = [
+        m.discharge_voltage_limit_v
+        for m in modules
+        if m.discharge_voltage_limit_v is not None
+    ]
     if dv_limits:
         snap.discharge_voltage_limit_v = max(dv_limits)
 
-    ci_limits = [m.charge_current_limit_a for m in modules if m.charge_current_limit_a is not None]
+    ci_limits = [
+        m.charge_current_limit_a
+        for m in modules
+        if m.charge_current_limit_a is not None
+    ]
     if ci_limits:
         snap.charge_current_limit_a = min(ci_limits)
 
-    di_limits = [m.discharge_current_limit_a for m in modules if m.discharge_current_limit_a is not None]
+    di_limits = [
+        m.discharge_current_limit_a
+        for m in modules
+        if m.discharge_current_limit_a is not None
+    ]
     if di_limits:
         snap.discharge_current_limit_a = min(di_limits)
 
@@ -177,7 +193,7 @@ class BmsPoller:
             ) from exc
 
         self._pylontech = pylontech.Pylontech(
-            port=self.port,
+            serial_port=self.port,
             baudrate=self.baudrate,
         )
         logger.info("Connected to Pylontech RS485 bus on %s", self.port)
@@ -208,8 +224,7 @@ class BmsPoller:
     def _read_module(self, address: int) -> ModuleData | None:
         """Read a single module by address. Returns None on communication error."""
         try:
-            # python-pylontech uses group= kwarg for multi-module addressing
-            info = self._pylontech.get_values_single(group=address)  # type: ignore[union-attr]
+            info = self._pylontech.get_values_single(address)  # type: ignore[union-attr]
             params = self._pylontech.get_system_parameters()  # type: ignore[union-attr]
         except Exception as exc:
             logger.warning("Failed to read Pylontech module %d: %s", address, exc)
@@ -232,12 +247,18 @@ class BmsPoller:
             )
 
             if params is not None:
-                module.charge_voltage_limit_v = getattr(params, "ChargeVoltageLimit", None)
-                module.discharge_voltage_limit_v = getattr(params, "DischargeVoltageLimit", None)
+                module.charge_voltage_limit_v = getattr(
+                    params, "ChargeVoltageLimit", None
+                )
+                module.discharge_voltage_limit_v = getattr(
+                    params, "DischargeVoltageLimit", None
+                )
                 cl = getattr(params, "ChargeCurrentLimit", None)
                 module.charge_current_limit_a = cl / 1000.0 if cl is not None else None
                 dl = getattr(params, "DischargeCurrentLimit", None)
-                module.discharge_current_limit_a = dl / 1000.0 if dl is not None else None
+                module.discharge_current_limit_a = (
+                    dl / 1000.0 if dl is not None else None
+                )
 
             logger.debug(
                 "Module %d: %.2fV %.1fA SoC=%.1f%% SoH=%.1f%%",

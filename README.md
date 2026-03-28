@@ -427,13 +427,13 @@ dependencies on the host.
 docker compose build
 
 # Poll the battery only
-docker compose run --rm --device /dev/ttyUSB1:/dev/ttyUSB1 poll --battery /dev/ttyUSB1
+docker compose run --rm -T --device /dev/ttyUSB1:/dev/ttyUSB1 poll --battery /dev/ttyUSB1
 
 # Poll the inverter only
-docker compose run --rm --device /dev/ttyUSB0:/dev/ttyUSB0 poll --inverter /dev/ttyUSB0
+docker compose run --rm -T --device /dev/ttyUSB0:/dev/ttyUSB0 poll --inverter /dev/ttyUSB0
 
 # Poll all three at once
-docker compose run --rm \
+docker compose run --rm -T \
     --device /dev/ttyUSB0:/dev/ttyUSB0 \
     --device /dev/ttyUSB1:/dev/ttyUSB1 \
     --device /dev/ttyUSB2:/dev/ttyUSB2 \
@@ -443,10 +443,10 @@ docker compose run --rm \
     --pv       /dev/ttyUSB2
 
 # Repeat every 10 seconds
-docker compose run --rm --device /dev/ttyUSB1:/dev/ttyUSB1 poll --battery /dev/ttyUSB1 --interval 10
+docker compose run --rm -T --device /dev/ttyUSB1:/dev/ttyUSB1 poll --battery /dev/ttyUSB1 --interval 10
 
 # JSON output (useful for piping into jq)
-docker compose run --rm --device /dev/ttyUSB1:/dev/ttyUSB1 poll --battery /dev/ttyUSB1 --json | jq .
+docker compose run --rm -T --device /dev/ttyUSB1:/dev/ttyUSB1 poll --battery /dev/ttyUSB1 --json | jq .
 
 # Show all available flags
 docker compose run --rm poll --help
@@ -457,6 +457,8 @@ docker compose run --rm poll --help
 > to pass through only the specific port(s) you need.  Keep both sides of the
 > colon identical (e.g. `/dev/ttyUSB1:/dev/ttyUSB1`) so the path you pass to
 > `--battery` / `--inverter` / `--pv` matches what exists inside the container.
+> Use `-T` to disable pseudo-TTY allocation for clean output — without it
+> Docker's PTY layer corrupts the ANSI escape codes and produces garbled text.
 
 #### Using `docker run` directly (without docker-compose)
 

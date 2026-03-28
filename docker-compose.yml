@@ -47,7 +47,10 @@ services:
   #
   # poll.py accepts device paths as CLI arguments, so there is no static
   # devices block here.  Pass through only the port(s) you actually need
-  # using --device on the docker compose run command, e.g.:
+  # using --device on the docker compose run command.
+  #
+  # Use -T to disable pseudo-TTY allocation for clean plain-text output
+  # (without it Docker's PTY layer corrupts ANSI escape codes), e.g.:
   #
   #   docker compose run --rm --device /dev/ttyUSB1:/dev/ttyUSB1 poll --battery /dev/ttyUSB1
   #   docker compose run --rm --device /dev/ttyUSB0:/dev/ttyUSB0 poll --inverter /dev/ttyUSB0
