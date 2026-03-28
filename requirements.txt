@@ -1,11 +1,10 @@
 paho-mqtt>=2.0.0
-paramiko>=3.0.0
 python-dotenv>=1.0.0
 pyserial>=3.5
 
-# M4-bypass: direct hardware drivers
+# Direct hardware drivers
 python-pylontech>=0.3.3   # Pylontech RS485 battery BMS protocol
-aurorapy>=0.2.7           # ABB Aurora RS485 PV inverter protocol
+aurorapy>=0.2.7           # ABB Aurora RS485 PV inverter protocol (optional)
 
 # Testing
 pytest>=7.4

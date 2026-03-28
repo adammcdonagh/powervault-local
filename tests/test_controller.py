@@ -166,16 +166,15 @@ class TestAllDiscoveryConfigs:
         topics = [t for t, _ in configs]
         assert any("battery_soc" in t for t in topics)
 
-    def test_pv_power_sensor_included(self):
+    def test_pv_power_sensor_not_in_core_configs(self):
         configs = ha_discovery.all_discovery_configs(DEVICE_ID)
         topics = [t for t, _ in configs]
-        assert any("pv_ac_power" in t for t in topics)
+        assert not any("pv_ac_power" in t for t in topics)
 
-    def test_binary_sensor_for_pv_producing(self):
+    def test_binary_sensor_not_in_core_configs(self):
         configs = ha_discovery.all_discovery_configs(DEVICE_ID)
         binary_topics = [t for t, _ in configs if t.startswith("homeassistant/binary_sensor/")]
-        assert len(binary_topics) >= 1
-        assert any("pv_producing" in t for t in binary_topics)
+        assert len(binary_topics) == 0
 
     def test_device_id_scoped_unique_ids(self):
         """Unique IDs from two different device IDs must not clash."""
@@ -230,6 +229,33 @@ class TestChargeModes:
     def test_all_modes_lowercase(self):
         for mode in CHARGE_MODES:
             assert mode == mode.lower()
+
+
+class TestPvDiscoveryConfigs:
+    def test_returns_non_empty_list(self):
+        configs = ha_discovery.pv_discovery_configs(DEVICE_ID)
+        assert len(configs) > 0
+
+    def test_pv_ac_power_included(self):
+        configs = ha_discovery.pv_discovery_configs(DEVICE_ID)
+        topics = [t for t, _ in configs]
+        assert any("pv_ac_power" in t for t in topics)
+
+    def test_binary_sensor_for_pv_producing(self):
+        configs = ha_discovery.pv_discovery_configs(DEVICE_ID)
+        binary_topics = [t for t, _ in configs if t.startswith("homeassistant/binary_sensor/")]
+        assert len(binary_topics) >= 1
+        assert any("pv_producing" in t for t in binary_topics)
+
+    def test_all_payloads_are_valid_json(self):
+        for _, payload_str in ha_discovery.pv_discovery_configs(DEVICE_ID):
+            payload = json.loads(payload_str)
+            assert isinstance(payload, dict)
+
+    def test_pv_configs_not_in_all_discovery_configs(self):
+        all_topics = {t for t, _ in ha_discovery.all_discovery_configs(DEVICE_ID)}
+        pv_topics = {t for t, _ in ha_discovery.pv_discovery_configs(DEVICE_ID)}
+        assert all_topics.isdisjoint(pv_topics)
 
 
 # ---------------------------------------------------------------------------

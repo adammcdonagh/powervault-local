@@ -41,7 +41,7 @@ class _SensorDef:
     component: str = "sensor"  # "sensor" or "binary_sensor"
 
 
-_SENSOR_DEFS: list[_SensorDef] = [
+_BMS_SENSOR_DEFS: list[_SensorDef] = [
     # --- BMS (Pylontech) ---
     _SensorDef("battery_soc", "Battery SoC", "%", "battery", "measurement"),
     _SensorDef("battery_soh", "Battery SoH (avg)", "%", "", "measurement", "mdi:battery-heart"),
@@ -59,8 +59,11 @@ _SENSOR_DEFS: list[_SensorDef] = [
     _SensorDef("bms_discharge_current_limit", "BMS Discharge Current Limit", "A", "current", "measurement"),
     _SensorDef("bms_charge_voltage_limit", "BMS Charge Voltage Limit", "V", "voltage", "measurement"),
     _SensorDef("bms_discharge_voltage_limit", "BMS Discharge Voltage Limit", "V", "voltage", "measurement"),
+]
 
-    # --- ABB PV inverter ---
+# PV sensors published when a PV source is configured (RS485 inverter or MQTT topic).
+# RS485 (ABB Aurora) populates all fields; an MQTT topic only populates pv_ac_power.
+_PV_SENSOR_DEFS: list[_SensorDef] = [
     _SensorDef("pv_ac_power", "PV AC Power", "W", "power", "measurement"),
     _SensorDef("pv_dc_power", "PV DC Power", "W", "power", "measurement"),
     _SensorDef("pv_dc_voltage", "PV DC Voltage", "V", "voltage", "measurement"),
@@ -71,8 +74,6 @@ _SENSOR_DEFS: list[_SensorDef] = [
     _SensorDef("pv_energy_today", "PV Energy Today", "kWh", "energy", "total_increasing"),
     _SensorDef("pv_energy_total", "PV Energy Total", "kWh", "energy", "total_increasing"),
     _SensorDef("pv_state", "PV Inverter State", "", "", "", "mdi:solar-panel"),
-
-    # --- Binary sensors ---
     _SensorDef(
         "pv_producing",
         "PV Producing",
@@ -200,13 +201,29 @@ def shelly_grid_power_discovery(device_id: str) -> tuple[str, str]:
 
 
 def all_discovery_configs(device_id: str) -> list[tuple[str, str]]:
-    """Return all ``(discovery_topic, json_payload)`` tuples.
+    """Return ``(discovery_topic, json_payload)`` tuples for core entities.
 
-    Publish all of these (retained) on controller startup so that HA
-    creates the full set of entities automatically.
+    Covers BMS (Pylontech) sensors and the charge-mode select entity.
+    Publish these (retained) on controller startup so HA creates the full
+    set of battery entities automatically.
+
+    PV sensor discovery is published separately via :func:`pv_discovery_configs`
+    only when a PV source is configured.
     """
     configs: list[tuple[str, str]] = [
-        _sensor_discovery(d, device_id) for d in _SENSOR_DEFS
+        _sensor_discovery(d, device_id) for d in _BMS_SENSOR_DEFS
     ]
     configs.append(charge_mode_select_discovery(device_id))
     return configs
+
+
+def pv_discovery_configs(device_id: str) -> list[tuple[str, str]]:
+    """Return ``(discovery_topic, json_payload)`` tuples for PV sensor entities.
+
+    Call this when a PV source is configured (``PV_INVERTER_PORT`` for direct
+    RS485 polling, or ``PV_GENERATION_TOPIC`` for an external MQTT feed).
+    When using an MQTT topic only ``pv_ac_power`` will receive updates; the
+    remaining sensors will be marked unavailable by HA until the controller
+    goes offline.
+    """
+    return [_sensor_discovery(d, device_id) for d in _PV_SENSOR_DEFS]

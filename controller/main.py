@@ -1,12 +1,15 @@
-"""Standalone M4-bypass controller for the Powervault P3.
+"""Standalone controller for the Powervault P3.
 
 This is the entry point for the fully independent local control stack.
-It replaces the dependency on the M4 controller's MQTT broker by talking
-directly to the hardware:
+It talks directly to the hardware over RS485 and USB, with no dependency on
+the Powervault cloud or the M4 controller's internal MQTT broker.
 
-  Pylontech batteries  ← RS485    → /dev/ttyUSB1 (python-pylontech)
-  Iconica inverter     ← USB/RS232 → /dev/ttyUSB0 (p18_serial)
-  ABB UNO PVI 3.0      ← RS485    → /dev/ttyUSB2 (aurorapy) [optional]
+Hardware wired to the Raspberry Pi (or equivalent Linux host):
+
+  Pylontech batteries  ← RS485    → /dev/ttyUSB1
+  Iconica inverter     ← USB/RS232 → /dev/ttyUSB0  (P18 protocol)
+  ABB UNO PVI 3.0      ← RS485    → /dev/ttyUSB2  (optional; Aurora protocol)
+  Shelly EM            ← WiFi/MQTT →               (optional; grid power)
 
 Control model
 -------------
@@ -34,6 +37,20 @@ Charge modes
   force_discharge – maximum discharge (bypasses ceiling, floor applies)
 
 BMS safety checks always apply and will revert to idle if violated.
+
+PV generation (optional)
+------------------------
+Two options are available — use one or the other, not both:
+
+  1. **Direct RS485 polling** (ABB UNO PVI 3.0 via Aurora protocol):
+     Set ``PV_INVERTER_PORT`` to the serial port connected to the inverter.
+     Leave blank to disable.
+
+  2. **External MQTT topic** (any solar inverter that publishes to MQTT):
+     Set ``PV_GENERATION_TOPIC`` to the topic your inverter or monitoring
+     device publishes AC power on (watts, plain float or JSON).  When set
+     this takes priority and ``PV_INVERTER_PORT`` is ignored.
+     Only ``pv_ac_power`` is populated via this path.
 
 Shelly EM grid-power integration
 ---------------------------------
@@ -69,30 +86,37 @@ so the battery covers the spike without pulling from the grid.
 Run directly:
   python -m controller.main
 
-Or via docker-compose with the ``controller`` profile.
+Or via docker-compose (see docker-compose.yml).
 
 Environment variables
 ---------------------
   INVERTER_PORT         Serial/USB port for the Iconica inverter
-  BATTERY_PORT          RS485 port for the Pylontech batteries
-  NUM_BATTERY_MODULES   Number of Pylontech modules in the stack
+                        (default /dev/ttyUSB0)
+  INVERTER_IS_USB       Set to "true" if using the USB HID port on the
+                        inverter front panel (default false)
+  BATTERY_PORT          RS485 port for the Pylontech battery stack
+                        (default /dev/ttyUSB1)
+  NUM_BATTERY_MODULES   Number of Pylontech modules in the stack (default 1)
 
   HA_MQTT_HOST          Home Assistant MQTT broker hostname
   HA_MQTT_PORT          HA broker port (default 1883)
   HA_MQTT_USER          HA broker username (optional)
   HA_MQTT_PASS          HA broker password (optional)
 
-  PV_INVERTER_PORT      RS485 port for the ABB Aurora PV inverter
-                        (leave unset to disable PV inverter polling)
-  PV_INVERTER_ADDRESS   Aurora RS485 address (default 2)
   DEVICE_ID             Identifier used in MQTT topics (default "powervault")
   POLL_INTERVAL         Seconds between full BMS/PV polling cycles (default 30)
-  INVERTER_IS_USB       Set to "true" if using USB HID port (default false)
 
-  SHELLY_GRID_POWER_TOPIC   MQTT topic for Shelly EM channel 1 grid power readings
-                             (leave unset to disable Shelly integration)
-  SHELLY_GRID_POWER_TOPIC_2 MQTT topic for Shelly EM channel 2 grid power readings
-                             (optional; when set, grid power = ch1 + ch2)
+  PV_INVERTER_PORT      RS485 port for the ABB Aurora PV inverter
+                        (leave unset to disable direct PV inverter polling)
+  PV_INVERTER_ADDRESS   Aurora RS485 address (default 2)
+  PV_GENERATION_TOPIC   MQTT topic publishing PV AC power in watts
+                        (alternative to PV_INVERTER_PORT; leave unset to
+                        disable MQTT-based PV; takes priority when set)
+
+  SHELLY_GRID_POWER_TOPIC   MQTT topic for Shelly EM channel 1 grid power
+                             readings (leave unset to disable Shelly)
+  SHELLY_GRID_POWER_TOPIC_2 MQTT topic for Shelly EM channel 2 grid power
+                             readings (optional; grid power = ch1 + ch2)
   PEAK_SHAVE_ENABLED         Set to "true" to enable automatic peak-shaving
   PEAK_SHAVE_IMPORT_W        Grid import threshold in W above which discharge
                              is triggered automatically (default 0)
@@ -100,6 +124,8 @@ Environment variables
                              (default 50)
   PEAK_SHAVE_MIN_APPLY_INTERVAL  Minimum seconds between fast-path inverter
                              commands (default 2)
+
+  LOG_LEVEL             Python logging level (default INFO)
 """
 
 from __future__ import annotations
@@ -248,14 +274,16 @@ def _build_mqtt_client(
     on_shelly_power: object = None,
     shelly_topic_2: str = "",
     on_shelly_power_2: object = None,
+    pv_gen_topic: str = "",
+    on_pv_power: object = None,
 ) -> mqtt.Client:
     """Build, configure and connect the MQTT client.
 
     Sets up:
     - Last Will and Testament (publishes "offline" on unexpected disconnect)
     - ``on_connect`` handler that resubscribes to the mode command topic and,
-      if configured, the Shelly grid-power topic(s)
-    - ``on_message`` handler that routes mode-command and Shelly messages
+      if configured, the Shelly grid-power topic(s) and PV generation topic
+    - ``on_message`` handler that routes mode-command and Shelly/PV messages
     """
     cmd_topic = ha_discovery.charge_mode_command_topic(device_id)
     avail_topic = ha_discovery.availability_topic(device_id)
@@ -281,6 +309,9 @@ def _build_mqtt_client(
             if shelly_topic_2:
                 client.subscribe(shelly_topic_2)
                 logger.info("Subscribed to Shelly topic 2: %s", shelly_topic_2)
+            if pv_gen_topic:
+                client.subscribe(pv_gen_topic)
+                logger.info("Subscribed to PV generation topic: %s", pv_gen_topic)
         else:
             logger.error("MQTT connect failed: %s", reason_code)
 
@@ -295,6 +326,8 @@ def _build_mqtt_client(
             on_shelly_power(message)
         elif shelly_topic_2 and message.topic == shelly_topic_2 and on_shelly_power_2:
             on_shelly_power_2(message)
+        elif pv_gen_topic and message.topic == pv_gen_topic and on_pv_power:
+            on_pv_power(message)
 
     client.on_connect = on_connect
     client.on_message = on_message
@@ -446,6 +479,10 @@ def run() -> None:
 
     pv_port = _env("PV_INVERTER_PORT", "")
     pv_address = _env_int("PV_INVERTER_ADDRESS", 2)
+    # MQTT-based PV generation topic takes priority over direct RS485 polling.
+    pv_gen_topic = _env("PV_GENERATION_TOPIC", "")
+    if pv_gen_topic:
+        pv_port = ""  # disable direct polling when MQTT topic is configured
 
     # Shelly EM / peak-shaving configuration
     shelly_topic = _env("SHELLY_GRID_POWER_TOPIC", "")
@@ -460,9 +497,11 @@ def run() -> None:
     logger.info("  Inverter:    %s (usb=%s)", inverter_port, is_usb)
     logger.info("  Batteries:   %s (%d modules)", battery_port, num_modules)
     if pv_port:
-        logger.info("  PV inverter: %s (address %d)", pv_port, pv_address)
+        logger.info("  PV inverter: %s (address %d, RS485)", pv_port, pv_address)
+    elif pv_gen_topic:
+        logger.info("  PV inverter: MQTT topic %s", pv_gen_topic)
     else:
-        logger.info("  PV inverter: disabled (set PV_INVERTER_PORT to enable)")
+        logger.info("  PV inverter: disabled (set PV_INVERTER_PORT or PV_GENERATION_TOPIC)")
     if shelly_topic and shelly_topic_2:
         logger.info(
             "  Shelly grid: ch1=%s ch2=%s (summed, peak_shave=%s)",
@@ -534,6 +573,22 @@ def run() -> None:
     on_shelly_ch1 = _make_shelly_handler(0) if shelly_topic else None
     on_shelly_ch2 = _make_shelly_handler(1) if shelly_topic_2 else None
 
+    def on_pv_generation(message: mqtt.MQTTMessage) -> None:
+        """Handle incoming PV generation readings from the external MQTT topic."""
+        power = _parse_shelly_power(message.payload)
+        if power is not None:
+            if _client_ref[0] is not None:
+                _client_ref[0].publish(
+                    _sensor_topic(device_id, "pv_ac_power"),
+                    str(round(power, 1)),
+                    retain=False,
+                )
+            logger.debug("PV generation (MQTT): %.1f W", power)
+        else:
+            logger.warning(
+                "Could not parse PV generation payload: %r", message.payload[:64]
+            )
+
     mqtt_client = _build_mqtt_client(
         device_id,
         on_mode_command,
@@ -542,6 +597,8 @@ def run() -> None:
         on_shelly_power=on_shelly_ch1,
         shelly_topic_2=shelly_topic_2,
         on_shelly_power_2=on_shelly_ch2,
+        pv_gen_topic=pv_gen_topic,
+        on_pv_power=on_pv_generation if pv_gen_topic else None,
     )
     _client_ref[0] = mqtt_client
     avail_topic = ha_discovery.availability_topic(device_id)
@@ -551,6 +608,13 @@ def run() -> None:
     for topic, payload in configs:
         mqtt_client.publish(topic, payload, retain=True)
     logger.info("Published %d HA discovery configs", len(configs))
+
+    # Publish PV sensor discovery only when a PV source is configured
+    if pv_port or pv_gen_topic:
+        pv_configs = ha_discovery.pv_discovery_configs(device_id)
+        for topic, payload in pv_configs:
+            mqtt_client.publish(topic, payload, retain=True)
+        logger.info("Published %d PV discovery configs", len(pv_configs))
 
     # Publish Shelly grid-power sensor discovery only when configured
     if shelly_topic:

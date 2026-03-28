@@ -1,352 +1,333 @@
 # powervault-local
 
-Local monitoring and control for the **Powervault P3** home battery system,
-following the company entering administration in November 2024.
+A standalone local controller for the **Powervault P3** home battery system,
+written after Powervault entered administration in November 2024.
+
+The controller talks directly to the hardware over RS485 and USB — no
+dependency on the Powervault cloud, the M4 board's internal MQTT broker, or
+any other external service. It publishes all sensor data to Home Assistant via
+MQTT and accepts charge-mode commands from HA in return.
 
 > ⚠️ **Disclaimer** — This is an unofficial community project. Use at your own
-> risk. Modifying your battery system may void warranties and could be unsafe
+> risk. Modifying battery hardware may void warranties and could be dangerous
 > if done incorrectly.
 
 ---
 
-## What's in the box
+## Repository layout
 
-| Component | Description |
-|-----------|-------------|
-| `ha-config/` | Ready-to-use Home Assistant YAML sensor, alarm and dashboard files |
-| `pv3_monitor/` | Python MQTT bridge with Home Assistant **auto-discovery** |
-| `p18_serial/` | P18 serial protocol driver for direct inverter control |
-
----
-
-## System Overview
-
-The Powervault P3 contains three key sub-systems:
-
-| Component | Detail |
-|-----------|--------|
-| **M4 Controller** | Custom NXP i.MX ARM board running embedded Linux |
-| **Iconica Inverter** | Rebranded Voltronic InfiniSolar E 5.5 kW (P18 protocol) |
-| **Pylontech Batteries** | US2000C modules, CAN/RS-485 BMS |
-| **FFR Metering** | CT clamps for grid / house / aux power measurement |
-
-### Current Status
-
-| Capability | Status | Notes |
-|------------|--------|-------|
-| **MQTT Monitoring** | ✅ Working | All metrics available, no auth required |
-| **Home Assistant Integration** | ✅ Working | Static YAML or auto-discovery bridge |
-| **Battery health data** | ✅ Working | SOH, cycles, cell voltages, temperatures |
-| **Inverter alarms** | ✅ Working | All 20+ alarm states |
-| **Schedule monitoring** | ✅ Working | Current event (0–4) and setpoint |
-| **MQTT Control** | ❌ Not working | M4 ignores locally published messages |
-| **SSH Schedule Control** | 🔄 Pending | Needs SSH access to M4 confirmed |
-| **P18 Direct Serial** | 🔄 Pending | Needs physical serial port access |
+```
+controller/          Main control loop, HA discovery, BMS safety logic
+p18_serial/          Voltronic P18 serial protocol driver (Iconica inverter)
+pylontech_driver/    Pylontech RS485 BMS driver
+abb_aurora/          ABB UNO PVI 3.0 Aurora RS485 driver (optional)
+tests/               Unit tests
+.env.example         All configuration options with explanations
+docker-compose.yml   Docker deployment
+```
 
 ---
 
-## Quick Start — Monitoring (Works Today)
+## Hardware overview
 
-### 1. Find the P3's IP address
+| Component | Protocol | Port |
+|-----------|----------|------|
+| Iconica inverter (Voltronic InfiniSolar E 5.5 kW) | P18 RS-232 or USB HID | `/dev/ttyUSB0` or `/dev/hidraw0` |
+| Pylontech US2000C battery stack | RS485 @ 115200 | `/dev/ttyUSB1` |
+| ABB UNO PVI 3.0 solar inverter *(optional)* | Aurora RS485 @ 19200 | `/dev/ttyUSB2` |
+| Shelly EM CT clamps *(optional)* | MQTT over WiFi | — |
 
-Check your router's DHCP client list for a device with MAC prefix `00:1F:7B`.
+> **USB isolator** — always use a USB isolator between the Raspberry Pi and the
+> Iconica inverter to protect the Pi from ground loops.
 
-### 2. Verify MQTT data is flowing
+---
+
+## Quick start
+
+### 1. Wire up the hardware
+
+**Pylontech RS485**
+
+Connect a USB-to-RS485 adapter to the RJ11/RJ12 RS485 port on the **master**
+(lowest-address) battery module:
+
+| Battery pin | RS485 wire |
+|-------------|-----------|
+| Pin 7 | A (positive) |
+| Pin 8 | B (negative) |
+
+Set DIP switch 1 on the master battery to **OFF** (selects 115200 baud).
+
+**Iconica inverter**
+
+Two options:
+- **USB HID** — plug into the USB port on the inverter front panel
+  (`/dev/hidraw0`, set `INVERTER_IS_USB=true`)
+- **USB-serial** — connect a USB-to-RS232 adapter to the RS-232 port
+  (`/dev/ttyUSB0`, set `INVERTER_IS_USB=false`)
+
+**ABB UNO PVI 3.0 *(optional)***
+
+Connect a USB-to-RS485 adapter to the RS485 terminals (A+, B−, GND) on the
+inverter. Set `PV_INVERTER_PORT=/dev/ttyUSB2`.
+
+If you do not have this inverter, leave `PV_INVERTER_PORT` blank — or use
+`PV_GENERATION_TOPIC` to subscribe to an MQTT topic that another device
+publishes PV power to instead (see [PV generation](#pv-generation-optional)).
+
+**Shelly EM *(optional)***
+
+Install the Shelly EM on your WiFi network and configure it to publish to your
+MQTT broker. Set `SHELLY_GRID_POWER_TOPIC` (and optionally
+`SHELLY_GRID_POWER_TOPIC_2` if you have two CT clamps on two fuse boards — the
+controller will sum both channels automatically).
+
+### 2. Configure
 
 ```bash
-mosquitto_sub -h 192.168.1.215 -t 'pv/#' -v
-```
-
-You should immediately see JSON messages on topics like:
-```
-pv/PV3/PV001001DEV/bms/soc
-pv/PV3/PV001001DEV/inverter/measurements
-pv/PV3/PV001001DEV/ffr/measurements
-...
-```
-
-### 3. Note your Device ID
-
-The device ID is the third path segment, e.g. `PV001001DEV`. Replace it
-throughout the YAML files.
-
----
-
-## Option A — Static HA YAML (Simplest)
-
-Connect Home Assistant **directly** to the P3's built-in MQTT broker. No
-extra software required.
-
-1. Add the P3 MQTT broker in `configuration.yaml`:
-
-   ```yaml
-   mqtt:
-     broker: 192.168.1.215   # ← your P3 IP
-     port: 1883
-   ```
-
-2. Copy the YAML files:
-
-   ```bash
-   cp ha-config/mqtt_sensors.yaml     /config/
-   cp ha-config/pylontech_sensors.yaml /config/
-   cp ha-config/alarm_sensors.yaml     /config/
-   ```
-
-3. Replace the placeholder device ID:
-
-   ```bash
-   sed -i 's/PV001001DEV/YOUR_ACTUAL_ID/g' /config/mqtt_sensors.yaml \
-     /config/pylontech_sensors.yaml /config/alarm_sensors.yaml
-   ```
-
-4. Add to `configuration.yaml`:
-
-   ```yaml
-   mqtt: !include mqtt_sensors.yaml
-   ```
-
-   Or append the `sensor:` sections to an existing `mqtt.yaml`.
-
-5. Copy the dashboard — see [`ha-config/README.md`](ha-config/README.md).
-
-6. Restart Home Assistant.
-
----
-
-## Option B — Python MQTT Bridge (Auto-Discovery)
-
-The bridge subscribes to the P3's broker, processes every message, and
-publishes Home Assistant MQTT auto-discovery payloads so entities appear
-automatically without any manual YAML.
-
-### Prerequisites
-
-- Python 3.10+
-- Access to your HA MQTT broker (username/password if required)
-
-### Setup
-
-```bash
-# Clone the repo
 git clone https://github.com/adammcdonagh/powervault-local.git
 cd powervault-local
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Configure
 cp .env.example .env
-# Edit .env with your P3 IP, device ID, and HA MQTT details
-nano .env
-
-# Run
-python -m pv3_monitor.bridge
+nano .env   # fill in your settings (see Configuration reference below)
 ```
 
-### Docker
+### 3. Run
+
+**Direct (Python 3.10+):**
 
 ```bash
-cp .env.example .env
-nano .env          # fill in your settings
+pip install -r requirements.txt
+python -m controller.main
+```
+
+**Docker:**
+
+```bash
 docker-compose up -d
 ```
 
-### What the bridge publishes
-
-For each sensor reading extracted from a P3 MQTT message the bridge:
-
-1. Publishes a **discovery config** to `homeassistant/sensor/<device_id>/pv3_<name>/config`
-   (retained, published once per sensor).
-2. Publishes the **current value** to `powervault/<device_id>/sensor/<name>/state`.
-
-For control, it also publishes:
-- A `select` entity for schedule mode (Idle / Charge / Discharge / Force Charge / Force Discharge)
-- A `number` entity for the power setpoint (0–5500 W)
+On first run the controller publishes MQTT auto-discovery payloads, so all
+entities appear in Home Assistant automatically — no manual YAML needed.
 
 ---
 
-## Control
+## Charge modes
 
-> **Note**: Publishing to the P3's MQTT broker does **not** control the system.
-> The M4 ignores all locally published messages — commands must arrive via the
-> Powervault cloud authentication path, which is no longer available.
+Control the battery via the **Charge Mode** select entity that appears in HA:
 
-Two local control paths are possible:
+| Mode | Behaviour |
+|------|-----------|
+| `idle` | Hold battery — neither charge from grid nor discharge to load |
+| `charge` | Charge from grid/solar (stopped at 95 % SoC) |
+| `discharge` | Discharge to power the house load (stopped at 15 % SoC) |
+| `force_charge` | Maximum grid charge, bypasses the 95 % ceiling |
+| `force_discharge` | Maximum discharge, bypasses the ceiling (15 % floor still applies) |
 
-### Path 1 — SSH Schedule Control (Recommended)
-
-The M4 reads charge/discharge schedules from a JSON file:
-```
-/data/appconfigs/cloudconnection/state_schedules/ffr_schedule.json
-```
-
-If you can establish SSH access to the M4 (serial console → enable SSH, or
-other access methods), the `ScheduleController` class can write this file:
-
-```python
-from pv3_monitor.schedule_control import ScheduleController, FORCE_CHARGE
-
-ctrl = ScheduleController(host="192.168.1.215", username="root")
-
-# Force charge from grid
-ctrl.force_charge(watts=3000)
-
-# Return to idle
-ctrl.idle()
-```
-
-**Schedule event codes** (confirmed via MQTT monitoring):
-
-| Code | Mode |
-|------|------|
-| 0 | Idle |
-| 1 | Charge |
-| 2 | Discharge |
-| 3 | Force Charge |
-| 4 | Force Discharge |
-
-Once SSH access is configured, the Python bridge exposes these modes as a
-Home Assistant `select` entity automatically.
-
-#### Getting SSH Access to the M4
-
-The most reliable path to SSH access is via the **DB9 RS-232 serial console**
-on the M4 board:
-
-1. Connect a USB-to-RS232 adapter to the DB9 port on the M4.
-2. Connect at **115200 baud, 8N1, no flow control**.
-3. Power-cycle the P3 and watch for U-Boot / Linux boot output.
-4. Log in at the `root@powervault:~#` prompt (or `powervault login:` prompt).
-5. Enable SSH: `systemctl enable --now sshd` (or equivalent).
-6. Add your public key to `/root/.ssh/authorized_keys`.
-
-> ⚠️ Accessing the M4's operating system may void your warranty and should
-> only be attempted once you understand the risks.
-
-### Path 2 — P18 Direct Serial (Advanced)
-
-The M4 communicates with the Iconica inverter over an internal RS-232 link
-using the **Voltronic P18 protocol**. If you can tap this line or connect
-directly to the inverter's own RS-232/USB port, the `P18Inverter` class
-provides full control:
-
-```python
-from p18_serial.p18 import P18Inverter
-
-with P18Inverter(port="/dev/ttyUSB0", baud_rate=2400) as inv:
-    # Query protocol
-    print(inv.get_protocol_id())   # → "PI18"
-    print(inv.get_mode())          # → "L" (Line mode)
-
-    # Force charge from grid
-    inv.force_charge(ac_amps=30)
-
-    # Return to normal solar/battery priority
-    inv.normal_mode()
-```
-
-**Key P18 commands implemented:**
-
-| Method | P18 Command | Description |
-|--------|-------------|-------------|
-| `set_output_priority("UTI")` | `^S006POP00` | Grid first |
-| `set_output_priority("SBU")` | `^S006POP02` | Solar → Battery → Grid |
-| `set_charger_priority("UTI")` | `^S006PCP00` | Charge from grid |
-| `set_charger_priority("SOL")` | `^S006PCP01` | Charge from solar |
-| `set_max_charge_current(30)` | `^S010MUCHGC030` | Max charge current |
-| `set_ac_charge_current(30)` | `^S010MCHGC030` | Grid charge current |
-| `set_battery_discharge_control(...)` | `^S010BATCD...` | Enable/disable charge/discharge |
-| `force_charge()` | composite | Grid charge, no discharge |
-| `normal_mode()` | composite | SBU priority, solar charge |
-
-> ⚠️ The P18 command set documented here is based on Voltronic community
-> documentation. Verify each command against your firmware before use.
-> **Always back out to `normal_mode()` if the system behaves unexpectedly.**
-
-#### Hardware connection
-
-The inverter can be accessed via:
-- **USB HID** port on the inverter front panel (`/dev/hidraw0`) — use `is_usb=True`
-- **RS-232** serial port (`/dev/ttyUSB0`) — 2400 baud, 8N1
-
-A serial proxy/intercept of the existing M4 ↔ inverter line is also possible
-but requires physical access to the internal cabling.
+The BMS safety limits (current, voltage) read from the Pylontech stack are
+programmed into the inverter on every poll cycle regardless of mode.
 
 ---
 
-## MQTT Topics Reference
+## PV generation *(optional)*
 
-All topics are published by the P3's M4 controller. All are read-only unless
-you have shell access to the M4.
+Two mutually exclusive options:
 
-| Topic | Payload | Notes |
-|-------|---------|-------|
-| `pv/PV3/<ID>/bms/soc` | `[{"measurement":"StateOfCharge","value":9700}]` | 9700 = 97.00% |
-| `pv/PV3/<ID>/inverter/measurements` | `[{"channel":"BATTERY","measurement":"Voltage","value":49800}]` | mV/mA/mW |
-| `pv/PV3/<ID>/inverter/alarms` | `{"fan_lock":"0", ..., "inverter_temperature":42.5}` | Bit flags + temps |
-| `pv/PV3/<ID>/inverter/charge` | `{"power":591}` | W; positive=discharge |
-| `pv/PV3/<ID>/pylontech/info` | `[{"measurement":"StateOfHealth","type":"Avg","value":92}]` | milli-units |
-| `pv/PV3/<ID>/ffr/measurements` | `[{"channel":"LOCAL","measurement":"Power","type":"Active","value":11736}]` | mW |
-| `pv/PV3/<ID>/schedule/event` | `{"event":0,"setpoint":0}` | event 0–4 |
-| `pv/PV3/<ID>/m4/maxpower` | `[{"ChgPower":4792,"DchgPower":-6750}]` | W |
-| `pv/PV3/<ID>/eps/status` | `{"Reserve":20,"Mode":0}` | % reserve |
-| `pv/PV3/<ID>/eps_schedule/event` | `{"reserved_soc":0,"event":"off"}` | EPS reserve |
-| `pv/PV3/<ID>/ffrcontroller/state` | `{"State":0}` | FFR controller |
-| `pv/PV3/<ID>/safetycheck/state` | various | Safety limits |
+### Option A — Direct RS485 polling (ABB UNO PVI 3.0)
 
-### FFR CT channel mapping
+Set `PV_INVERTER_PORT` to the serial port connected to the inverter.  The
+controller uses the Aurora protocol to read AC power, DC power, grid voltage /
+frequency, temperature, and daily/total energy, publishing each as a separate
+HA sensor.
 
-> **The physical CT clamp labels on the M4 board are swapped in software:**
+### Option B — External MQTT topic
 
-| MQTT channel | Physical label | Measures |
-|--------------|----------------|----------|
-| `LOCAL` | LOCAL | House consumption |
-| `HOUSE` | HOUSE | Grid power (+ import / − export) |
-| `AUX1` | AUX1 | Auxiliary circuit |
+If you have any other solar inverter (or a Shelly device clamped to the PV
+output), set `PV_GENERATION_TOPIC` to the topic it publishes AC power on.  The
+payload can be a plain watt value (`"1500.0"`) or JSON containing one of the
+common power keys (`apower`, `act_power`, `power`, etc.).  Only `pv_ac_power`
+is populated via this path.
+
+When `PV_GENERATION_TOPIC` is set it takes priority and `PV_INVERTER_PORT` is
+ignored.
 
 ---
 
-## Running Tests
+## Shelly EM grid power *(optional)*
+
+Set `SHELLY_GRID_POWER_TOPIC` to the topic your Shelly EM publishes active
+power on.  Supported payload formats:
+
+| Device generation | Topic example | Payload |
+|-------------------|---------------|---------|
+| Gen 1 EM | `shellies/shellyem-aabbcc/emeter/0/power` | Plain float: `"1234.5"` |
+| Gen 2 / Gen 3 | `shellyplusem-aabbcc/status/em:0` | JSON: `{"apower": 1234.5, ...}` |
+
+**Two CT clamps / two fuse boards**
+
+If you have one CT clamp on each of two fuse boards, set both topics:
+
+```
+SHELLY_GRID_POWER_TOPIC=shellies/shellyem-aabbcc/emeter/0/power
+SHELLY_GRID_POWER_TOPIC_2=shellies/shellyem-aabbcc/emeter/1/power
+```
+
+The controller sums both channels and publishes the total as `grid_power`.
+
+**Sign convention** — positive = importing from grid, negative = exporting.
+
+---
+
+## Peak-shaving *(optional)*
+
+Requires `SHELLY_GRID_POWER_TOPIC`.
+
+```
+PEAK_SHAVE_ENABLED=true
+PEAK_SHAVE_IMPORT_W=2000      # trigger discharge above this threshold
+PEAK_SHAVE_HYSTERESIS_W=50    # deadband to prevent rapid toggling
+PEAK_SHAVE_MIN_APPLY_INTERVAL=2  # minimum seconds between commands
+```
+
+When enabled, the controller automatically overrides the HA-selected mode with
+`discharge` whenever grid import exceeds `PEAK_SHAVE_IMPORT_W +
+PEAK_SHAVE_HYSTERESIS_W`.  The response time is within
+`PEAK_SHAVE_MIN_APPLY_INTERVAL` seconds of a Shelly reading arriving (much
+faster than the normal `POLL_INTERVAL` cycle).
+
+---
+
+## Configuration reference
+
+All settings are read from environment variables (or a `.env` file).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HA_MQTT_HOST` | *(required)* | Home Assistant MQTT broker hostname or IP |
+| `HA_MQTT_PORT` | `1883` | HA broker port |
+| `HA_MQTT_USER` | | HA broker username (leave blank if not required) |
+| `HA_MQTT_PASS` | | HA broker password |
+| `DEVICE_ID` | `powervault` | Prefix used in all published MQTT topics |
+| `POLL_INTERVAL` | `30` | Seconds between full BMS/PV polling cycles |
+| `INVERTER_PORT` | `/dev/ttyUSB0` | Serial/USB port for the Iconica inverter |
+| `INVERTER_IS_USB` | `false` | Set `true` to use the USB HID port (`/dev/hidraw0`) |
+| `BATTERY_PORT` | `/dev/ttyUSB1` | RS485 port for the Pylontech battery stack |
+| `NUM_BATTERY_MODULES` | `1` | Number of Pylontech modules (addresses 0 … N-1) |
+| `PV_INVERTER_PORT` | | RS485 port for the ABB Aurora PV inverter; leave blank to disable |
+| `PV_INVERTER_ADDRESS` | `2` | Aurora RS485 address |
+| `PV_GENERATION_TOPIC` | | MQTT topic publishing PV AC power in watts; takes priority over `PV_INVERTER_PORT` when set |
+| `SHELLY_GRID_POWER_TOPIC` | | Shelly EM channel 1 power topic; leave blank to disable |
+| `SHELLY_GRID_POWER_TOPIC_2` | | Shelly EM channel 2 power topic (summed with channel 1) |
+| `PEAK_SHAVE_ENABLED` | `false` | Enable automatic peak-shaving |
+| `PEAK_SHAVE_IMPORT_W` | `0` | Grid import threshold in W |
+| `PEAK_SHAVE_HYSTERESIS_W` | `50` | Deadband in W above threshold |
+| `PEAK_SHAVE_MIN_APPLY_INTERVAL` | `2` | Minimum seconds between fast-path commands |
+| `LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+---
+
+## MQTT topics published
+
+The controller publishes all sensor readings to your HA MQTT broker under
+`powervault/<DEVICE_ID>/sensor/<name>/state`.
+
+**Battery (always published)**
+
+| Sensor name | Unit | Description |
+|-------------|------|-------------|
+| `battery_soc` | % | State of Charge |
+| `battery_soh` | % | State of Health (average across modules) |
+| `battery_soh_min` | % | State of Health (lowest module) |
+| `battery_cycle_count` | | Maximum cycle count across modules |
+| `battery_voltage` | V | Pack voltage |
+| `battery_current` | A | Pack current (positive = charging) |
+| `battery_power` | W | Pack power |
+| `battery_cell_voltage_max` | V | Highest cell voltage |
+| `battery_cell_voltage_min` | V | Lowest cell voltage |
+| `battery_cell_temp_avg` | °C | Average cell temperature |
+| `battery_cell_temp_max` | °C | Hottest cell |
+| `battery_cell_temp_min` | °C | Coolest cell |
+| `bms_charge_current_limit` | A | BMS maximum charge current |
+| `bms_discharge_current_limit` | A | BMS maximum discharge current |
+| `bms_charge_voltage_limit` | V | BMS charge voltage limit |
+| `bms_discharge_voltage_limit` | V | BMS discharge cutoff voltage |
+
+**PV inverter (published when `PV_INVERTER_PORT` or `PV_GENERATION_TOPIC` is set)**
+
+| Sensor name | Unit | Description |
+|-------------|------|-------------|
+| `pv_ac_power` | W | AC output power |
+| `pv_dc_power` | W | DC input power from panels *(RS485 only)* |
+| `pv_dc_voltage` | V | Panel-side voltage *(RS485 only)* |
+| `pv_dc_current` | A | Panel-side current *(RS485 only)* |
+| `pv_grid_voltage` | V | Grid voltage *(RS485 only)* |
+| `pv_grid_frequency` | Hz | Grid frequency *(RS485 only)* |
+| `pv_temperature` | °C | Inverter temperature *(RS485 only)* |
+| `pv_energy_today` | kWh | Energy generated today *(RS485 only)* |
+| `pv_energy_total` | kWh | Lifetime energy *(RS485 only)* |
+| `pv_state` | | Inverter state string *(RS485 only)* |
+| `pv_producing` | | Binary sensor — ON when producing *(RS485 only)* |
+
+**Grid power (published when `SHELLY_GRID_POWER_TOPIC` is set)**
+
+| Sensor name | Unit | Description |
+|-------------|------|-------------|
+| `grid_power` | W | Grid power — positive = import, negative = export |
+
+**Control**
+
+| Topic | Direction | Description |
+|-------|-----------|-------------|
+| `powervault/<ID>/control/charge_mode/set` | HA → controller | Set the charge mode |
+| `powervault/<ID>/control/charge_mode/state` | Controller → HA | Current applied mode |
+| `powervault/<ID>/availability` | Controller → HA | `online` / `offline` |
+
+---
+
+## P18 protocol notes
+
+The Iconica inverter is a rebranded **Voltronic InfiniSolar E 5.5 kW** and
+speaks the Voltronic P18 protocol over RS-232 (2400 baud, 8N1) or USB HID.
+
+The protocol is documented by the community and implemented in various tools
+including [inverter-tools](https://github.com/gch1p/inverter-tools).  The
+`p18_serial/` module in this repo implements the subset of commands needed for
+charge/discharge control:
+
+| P18 command | Method | Description |
+|-------------|--------|-------------|
+| `^S006POP<code>` | `set_output_priority()` | Output source priority (UTI/SOL/SBU) |
+| `^S006PCP<code>` | `set_charger_priority()` | Charger source priority (UTI/SOL/MIX/ONL) |
+| `^S010MUCHGC<n>` | `set_max_charge_current()` | Total max charge current (A) |
+| `^S010MCHGC<n>` | `set_ac_charge_current()` | Grid charge current (A) |
+| `^S008PBCV<v>` | `set_battery_recharge_voltage()` | Re-charge voltage (V) |
+| `^S009PSDV<v>` | `set_battery_cutoff_voltage()` | Low-voltage cutoff (V) |
+| `^S010BATCD<flags>` | `set_battery_discharge_control()` | Grid charge / discharge flags |
+
+> ⚠️ Commands are verified against Voltronic community documentation and
+> the [inverter-tools](https://github.com/gch1p/inverter-tools) reference
+> implementation.  Always verify against your firmware before relying on them.
+> Call `normal_mode()` to return to safe defaults if anything behaves
+> unexpectedly.
+
+---
+
+## Running tests
 
 ```bash
 pip install -r requirements.txt
 python -m pytest tests/ -v
 ```
 
-All 156 tests should pass.
-
----
-
-## Hardware Notes
-
-- The M4 controller MAC address prefix is `00:1F:7B`.
-- The M4 boots from **eMMC** (not SD card).
-- The DB9 serial port on the M4 is the recommended path for console access.
-- The rotary hex switch (0–F) on the M4 edge may control RS-485 device address
-  or boot mode — note its current position before changing.
-
 ---
 
 ## Contributing
 
-Found something that works (or doesn't)? Please open an issue or PR with:
-- Your unit model / serial prefix
-- Firmware version if known
-- What you tested and what happened
-
-Especially valuable: confirmed P18 command responses, SSH/serial console
-access methods, and schedule file formats.
-
----
-
-## Related Resources
-
-- [Community findings repository (kevin-bird/powervault-p3-local)](https://github.com/kevin-bird/powervault-p3-local)
-- [Powervault Owners Facebook Group](https://www.facebook.com/groups/powervaultowners)
+Found something that works (or doesn't)? Please open an issue or PR.
+Especially welcome: confirmed P18 command responses for other Voltronic
+firmware versions, Pylontech module variants, and Shelly MQTT payload formats.
 
 ---
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE) file.
+MIT

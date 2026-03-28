@@ -1,56 +1,41 @@
 services:
-  # --- Legacy M4-dependent MQTT bridge (keep while M4 is still running) ---
-  pv3_bridge:
-    build: .
-    container_name: pv3_bridge
-    restart: unless-stopped
-    environment:
-      P3_HOST: ${P3_HOST:-192.168.1.215}
-      P3_MQTT_PORT: ${P3_MQTT_PORT:-1883}
-      P3_DEVICE_ID: ${P3_DEVICE_ID:-PV001001DEV}
-      HA_MQTT_HOST: ${HA_MQTT_HOST:-}
-      HA_MQTT_PORT: ${HA_MQTT_PORT:-1883}
-      HA_MQTT_USER: ${HA_MQTT_USER:-}
-      HA_MQTT_PASS: ${HA_MQTT_PASS:-}
-      M4_SSH_HOST: ${M4_SSH_HOST:-}
-      M4_SSH_PORT: ${M4_SSH_PORT:-22}
-      M4_SSH_USER: ${M4_SSH_USER:-root}
-      M4_SSH_KEY_FILE: ${M4_SSH_KEY_FILE:-}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    volumes:
-      # Mount SSH key if using key-based auth for schedule control
-      - ${M4_SSH_KEY_FILE:-/dev/null}:${M4_SSH_KEY_FILE:-/dev/null}:ro
-
-  # --- M4-bypass standalone controller (replaces the bridge entirely) ---
-  # Disable pv3_bridge and enable this service once direct hardware wiring
-  # is in place (USB → inverter, RS485 → batteries, RS485 → ABB PV inverter).
   controller:
     build: .
     container_name: powervault_controller
     restart: unless-stopped
     command: ["python", "-m", "controller.main"]
     # Expose serial/USB ports. Adjust device paths to match your system.
-    # Check with: ls /dev/ttyUSB* /dev/hidraw*
+    # Discover ports with: ls /dev/ttyUSB* /dev/hidraw*
     devices:
       - ${INVERTER_PORT:-/dev/ttyUSB0}:${INVERTER_PORT:-/dev/ttyUSB0}
       - ${BATTERY_PORT:-/dev/ttyUSB1}:${BATTERY_PORT:-/dev/ttyUSB1}
-      # Uncomment when ABB PV inverter is wired:
+      # Uncomment when the ABB PV inverter is wired (PV_INVERTER_PORT must also be set):
       # - ${PV_INVERTER_PORT:-/dev/ttyUSB2}:${PV_INVERTER_PORT:-/dev/ttyUSB2}
     environment:
       DEVICE_ID: ${DEVICE_ID:-powervault}
+      POLL_INTERVAL: ${POLL_INTERVAL:-30}
+      # Iconica inverter
       INVERTER_PORT: ${INVERTER_PORT:-/dev/ttyUSB0}
       INVERTER_IS_USB: ${INVERTER_IS_USB:-false}
+      # Pylontech batteries
       BATTERY_PORT: ${BATTERY_PORT:-/dev/ttyUSB1}
       NUM_BATTERY_MODULES: ${NUM_BATTERY_MODULES:-1}
+      # PV generation (Option A: direct RS485 polling)
       PV_INVERTER_PORT: ${PV_INVERTER_PORT:-}
       PV_INVERTER_ADDRESS: ${PV_INVERTER_ADDRESS:-2}
-      POLL_INTERVAL: ${POLL_INTERVAL:-30}
+      # PV generation (Option B: external MQTT topic — overrides Option A when set)
+      PV_GENERATION_TOPIC: ${PV_GENERATION_TOPIC:-}
+      # HA MQTT broker
       HA_MQTT_HOST: ${HA_MQTT_HOST:-}
       HA_MQTT_PORT: ${HA_MQTT_PORT:-1883}
       HA_MQTT_USER: ${HA_MQTT_USER:-}
       HA_MQTT_PASS: ${HA_MQTT_PASS:-}
+      # Shelly EM grid power
+      SHELLY_GRID_POWER_TOPIC: ${SHELLY_GRID_POWER_TOPIC:-}
+      SHELLY_GRID_POWER_TOPIC_2: ${SHELLY_GRID_POWER_TOPIC_2:-}
+      # Peak-shaving
+      PEAK_SHAVE_ENABLED: ${PEAK_SHAVE_ENABLED:-false}
+      PEAK_SHAVE_IMPORT_W: ${PEAK_SHAVE_IMPORT_W:-0}
+      PEAK_SHAVE_HYSTERESIS_W: ${PEAK_SHAVE_HYSTERESIS_W:-50}
+      PEAK_SHAVE_MIN_APPLY_INTERVAL: ${PEAK_SHAVE_MIN_APPLY_INTERVAL:-2}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    profiles:
-      # Run with: docker-compose --profile controller up
-      # This keeps the service dormant until explicitly requested.
-      - controller
