@@ -232,6 +232,107 @@ class TestChargeModes:
             assert mode == mode.lower()
 
 
+# ---------------------------------------------------------------------------
+# _parse_shelly_power tests
+# ---------------------------------------------------------------------------
+
+from controller.main import _parse_shelly_power, _effective_mode
+
+
+class TestParseShellPower:
+    def test_plain_float_string(self):
+        assert _parse_shelly_power(b"1234.5") == pytest.approx(1234.5)
+
+    def test_plain_negative_float(self):
+        assert _parse_shelly_power(b"-400.0") == pytest.approx(-400.0)
+
+    def test_plain_integer_string(self):
+        assert _parse_shelly_power(b"2000") == pytest.approx(2000.0)
+
+    def test_gen1_with_whitespace(self):
+        assert _parse_shelly_power(b"  850.3\n") == pytest.approx(850.3)
+
+    def test_gen2_json_apower(self):
+        payload = json.dumps({"id": 0, "apower": 1500.0, "voltage": 230.0}).encode()
+        assert _parse_shelly_power(payload) == pytest.approx(1500.0)
+
+    def test_gen2_json_act_power(self):
+        payload = json.dumps({"act_power": 750.5}).encode()
+        assert _parse_shelly_power(payload) == pytest.approx(750.5)
+
+    def test_gen2_json_power_key(self):
+        payload = json.dumps({"power": 300.0}).encode()
+        assert _parse_shelly_power(payload) == pytest.approx(300.0)
+
+    def test_gen3_json_a_act_power(self):
+        payload = json.dumps({"a_act_power": 1800.0}).encode()
+        assert _parse_shelly_power(payload) == pytest.approx(1800.0)
+
+    def test_json_null_power_falls_through(self):
+        # value is null — should not match, return None
+        payload = json.dumps({"power": None}).encode()
+        assert _parse_shelly_power(payload) is None
+
+    def test_invalid_payload_returns_none(self):
+        assert _parse_shelly_power(b"not-a-number") is None
+
+    def test_empty_payload_returns_none(self):
+        assert _parse_shelly_power(b"") is None
+
+    def test_json_no_known_key_returns_none(self):
+        payload = json.dumps({"reactive": 50.0}).encode()
+        assert _parse_shelly_power(payload) is None
+
+
+# ---------------------------------------------------------------------------
+# _effective_mode tests
+# ---------------------------------------------------------------------------
+
+class TestEffectiveMode:
+    def _call(
+        self,
+        requested="idle",
+        grid_w=None,
+        peak_shave=False,
+        threshold=0.0,
+        hysteresis=50.0,
+    ) -> str:
+        return _effective_mode(requested, grid_w, peak_shave, threshold, hysteresis)
+
+    def test_returns_requested_when_peak_shave_disabled(self):
+        assert self._call("discharge", grid_w=5000.0, peak_shave=False) == "discharge"
+
+    def test_returns_requested_when_no_grid_reading(self):
+        assert self._call("idle", grid_w=None, peak_shave=True, threshold=0.0) == "idle"
+
+    def test_override_to_discharge_above_threshold_plus_hysteresis(self):
+        # threshold=0, hysteresis=50 → triggers above 50 W
+        assert self._call("idle", grid_w=51.0, peak_shave=True, threshold=0.0, hysteresis=50.0) == "discharge"
+
+    def test_no_override_exactly_at_threshold_plus_hysteresis(self):
+        # must be strictly greater than threshold + hysteresis
+        assert self._call("idle", grid_w=50.0, peak_shave=True, threshold=0.0, hysteresis=50.0) == "idle"
+
+    def test_no_override_below_threshold(self):
+        assert self._call("idle", grid_w=30.0, peak_shave=True, threshold=0.0, hysteresis=50.0) == "idle"
+
+    def test_no_override_when_exporting(self):
+        assert self._call("idle", grid_w=-200.0, peak_shave=True, threshold=0.0) == "idle"
+
+    def test_existing_mode_preserved_below_threshold(self):
+        # HA has requested "charge"; grid is low — honour the request
+        assert self._call("charge", grid_w=10.0, peak_shave=True, threshold=100.0, hysteresis=50.0) == "charge"
+
+    def test_override_even_when_requested_mode_is_charge(self):
+        # Spike while HA requested charge — safety: prioritise peak-shaving
+        assert self._call("charge", grid_w=2000.0, peak_shave=True, threshold=500.0, hysteresis=50.0) == "discharge"
+
+    def test_custom_threshold(self):
+        # threshold=3000, hysteresis=50 → triggers above 3050 W
+        assert self._call("idle", grid_w=3100.0, peak_shave=True, threshold=3000.0, hysteresis=50.0) == "discharge"
+        assert self._call("idle", grid_w=3000.0, peak_shave=True, threshold=3000.0, hysteresis=50.0) == "idle"
+
+
 class TestTopicHelpers:
     def test_sensor_state_topic_contains_device_and_name(self):
         topic = ha_discovery.sensor_state_topic(DEVICE_ID, "battery_soc")

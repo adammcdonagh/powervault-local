@@ -35,6 +35,31 @@ Charge modes
 
 BMS safety checks always apply and will revert to idle if violated.
 
+Shelly EM grid-power integration
+---------------------------------
+Set ``SHELLY_GRID_POWER_TOPIC`` to the MQTT topic your Shelly EM device
+publishes grid power on (e.g. ``shellies/shellyem-aabbcc/emeter/0/power``
+for Gen1, or the equivalent Gen2/Gen3 JSON topic).  The controller will:
+
+  1. Subscribe to that topic and parse the power value (plain float **or**
+     JSON with ``power`` / ``apower`` / ``act_power`` keys).
+  2. Publish the reading as an HA sensor (``grid_power``).
+  3. Wake the control loop immediately so the inverter mode is re-evaluated
+     within ``PEAK_SHAVE_MIN_APPLY_INTERVAL`` seconds (default 2 s) of the
+     reading arriving — far faster than the normal ``POLL_INTERVAL``.
+
+Note: the Shelly CT clamp plugs into the Shelly EM hardware device, which
+connects to your WiFi network.  The CT clamp cannot be wired directly to
+the Raspberry Pi GPIO pins.
+
+Peak-shaving
+------------
+Set ``PEAK_SHAVE_ENABLED=true`` together with ``SHELLY_GRID_POWER_TOPIC``
+to enable automatic peak-shaving.  When grid import exceeds
+``PEAK_SHAVE_IMPORT_W`` (+ ``PEAK_SHAVE_HYSTERESIS_W`` deadband), the
+controller automatically overrides the HA-selected mode with ``discharge``
+so the battery covers the spike without pulling from the grid.
+
 Run directly:
   python -m controller.main
 
@@ -55,14 +80,26 @@ Environment variables
                         (leave unset to disable PV inverter polling)
   PV_INVERTER_ADDRESS   Aurora RS485 address (default 2)
   DEVICE_ID             Identifier used in MQTT topics (default "powervault")
-  POLL_INTERVAL         Seconds between polling cycles (default 30)
+  POLL_INTERVAL         Seconds between full BMS/PV polling cycles (default 30)
   INVERTER_IS_USB       Set to "true" if using USB HID port (default false)
+
+  SHELLY_GRID_POWER_TOPIC   MQTT topic for Shelly EM grid power readings
+                             (leave unset to disable Shelly integration)
+  PEAK_SHAVE_ENABLED         Set to "true" to enable automatic peak-shaving
+  PEAK_SHAVE_IMPORT_W        Grid import threshold in W above which discharge
+                             is triggered automatically (default 0)
+  PEAK_SHAVE_HYSTERESIS_W    Deadband in W to prevent rapid mode toggling
+                             (default 50)
+  PEAK_SHAVE_MIN_APPLY_INTERVAL  Minimum seconds between fast-path inverter
+                             commands (default 2)
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import threading
 import time
 
 import paho.mqtt.client as mqtt
@@ -105,6 +142,82 @@ def _env_bool(key: str, default: bool = False) -> bool:
     return default
 
 
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Shelly EM helpers
+# ---------------------------------------------------------------------------
+
+def _parse_shelly_power(payload: bytes) -> float | None:
+    """Parse a Shelly EM MQTT power payload.
+
+    Supports:
+
+    - **Shelly Gen1** (plain float string): ``"1234.5"``
+    - **Shelly Gen2 / Gen3** (JSON with various key names):
+      ``{"apower": 1234.5, ...}`` or ``{"act_power": 1234.5, ...}``
+
+    Returns the active power in watts (positive = import, negative = export),
+    or *None* if the payload cannot be parsed.
+    """
+    text = payload.decode(errors="replace").strip()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        data = json.loads(text)
+        for key in ("power", "apower", "act_power", "a_act_power", "total_act_power"):
+            if key in data and data[key] is not None:
+                return float(data[key])
+    except (ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _effective_mode(
+    requested: str,
+    grid_w: float | None,
+    peak_shave: bool,
+    import_threshold_w: float,
+    hysteresis_w: float,
+) -> str:
+    """Return the effective inverter mode, applying peak-shaving if active.
+
+    When peak-shaving is enabled and the grid import exceeds
+    *import_threshold_w* + *hysteresis_w*, the mode is overridden to
+    ``"discharge"`` regardless of the HA-requested mode.  The hysteresis
+    prevents rapid toggling near the threshold.
+
+    Parameters
+    ----------
+    requested:
+        The charge mode last requested by HA (or ``"idle"`` by default).
+    grid_w:
+        Latest grid power in watts (positive = import, negative = export),
+        or *None* if no Shelly reading has been received yet.
+    peak_shave:
+        Whether peak-shaving auto-discharge is enabled.
+    import_threshold_w:
+        Grid import level in watts above which battery discharge is triggered.
+    hysteresis_w:
+        Additional deadband above *import_threshold_w* to avoid rapid
+        mode switching.
+    """
+    if (
+        peak_shave
+        and grid_w is not None
+        and grid_w > import_threshold_w + hysteresis_w
+    ):
+        return "discharge"
+    return requested
+
+
 # ---------------------------------------------------------------------------
 # MQTT client factory
 # ---------------------------------------------------------------------------
@@ -113,13 +226,16 @@ def _build_mqtt_client(
     device_id: str,
     on_mode_command: object,
     logger: logging.Logger,
+    shelly_topic: str = "",
+    on_shelly_power: object = None,
 ) -> mqtt.Client:
     """Build, configure and connect the MQTT client.
 
     Sets up:
     - Last Will and Testament (publishes "offline" on unexpected disconnect)
-    - ``on_connect`` handler that resubscribes to the mode command topic
-    - ``on_message`` handler that calls *on_mode_command* for mode changes
+    - ``on_connect`` handler that resubscribes to the mode command topic and,
+      if configured, the Shelly grid-power topic
+    - ``on_message`` handler that routes mode-command and Shelly messages
     """
     cmd_topic = ha_discovery.charge_mode_command_topic(device_id)
     avail_topic = ha_discovery.availability_topic(device_id)
@@ -139,6 +255,9 @@ def _build_mqtt_client(
         if str(reason_code) == "Success":
             client.subscribe(cmd_topic)
             logger.info("MQTT connected — subscribed to %s", cmd_topic)
+            if shelly_topic:
+                client.subscribe(shelly_topic)
+                logger.info("Subscribed to Shelly topic: %s", shelly_topic)
         else:
             logger.error("MQTT connect failed: %s", reason_code)
 
@@ -149,6 +268,8 @@ def _build_mqtt_client(
     ) -> None:
         if message.topic == cmd_topic:
             on_mode_command(client, message)
+        elif shelly_topic and message.topic == shelly_topic and on_shelly_power:
+            on_shelly_power(message)
 
     client.on_connect = on_connect
     client.on_message = on_message
@@ -301,6 +422,14 @@ def run() -> None:
     pv_port = _env("PV_INVERTER_PORT", "")
     pv_address = _env_int("PV_INVERTER_ADDRESS", 2)
 
+    # Shelly EM / peak-shaving configuration
+    shelly_topic = _env("SHELLY_GRID_POWER_TOPIC", "")
+    peak_shave_enabled = _env_bool("PEAK_SHAVE_ENABLED", False)
+    peak_shave_import_w = _env_float("PEAK_SHAVE_IMPORT_W", 0.0)
+    peak_shave_hysteresis_w = _env_float("PEAK_SHAVE_HYSTERESIS_W", 50.0)
+    # Minimum seconds between fast-path inverter commands (debounce)
+    min_apply_interval = _env_float("PEAK_SHAVE_MIN_APPLY_INTERVAL", 2.0)
+
     logger.info("Starting M4-bypass controller (device_id=%s)", device_id)
     logger.info("  Inverter:    %s (usb=%s)", inverter_port, is_usb)
     logger.info("  Batteries:   %s (%d modules)", battery_port, num_modules)
@@ -308,10 +437,21 @@ def run() -> None:
         logger.info("  PV inverter: %s (address %d)", pv_port, pv_address)
     else:
         logger.info("  PV inverter: disabled (set PV_INVERTER_PORT to enable)")
+    if shelly_topic:
+        logger.info("  Shelly grid: %s (peak_shave=%s)", shelly_topic, peak_shave_enabled)
+    else:
+        logger.info("  Shelly grid: disabled (set SHELLY_GRID_POWER_TOPIC to enable)")
 
     # --- Thread-safe mode storage (written by MQTT callback, read by main loop) ---
-    # A one-element list is used so the closure in on_mode_command can mutate it.
+    # One-element lists are used so closures can mutate them.
     _mode: list[str] = ["idle"]
+    _latest_grid_w: list[float | None] = [None]
+    # Timestamp of the last inverter command (monotonic); used for fast-path debounce.
+    _last_apply_time: list[float] = [0.0]
+    # Event set by the Shelly MQTT callback to wake the main loop early.
+    _fast_apply = threading.Event()
+    # Forward reference so on_shelly_power can publish via the MQTT client.
+    _client_ref: list[mqtt.Client | None] = [None]
 
     def on_mode_command(client: mqtt.Client, message: mqtt.MQTTMessage) -> None:
         mode = message.payload.decode().strip().lower()
@@ -327,7 +467,31 @@ def run() -> None:
         else:
             logger.warning("Unknown charge mode received: %r (ignored)", mode)
 
-    mqtt_client = _build_mqtt_client(device_id, on_mode_command, logger)
+    def on_shelly_power(message: mqtt.MQTTMessage) -> None:
+        power = _parse_shelly_power(message.payload)
+        if power is not None:
+            _latest_grid_w[0] = power
+            if _client_ref[0] is not None:
+                _client_ref[0].publish(
+                    _sensor_topic(device_id, "grid_power"),
+                    str(round(power, 1)),
+                    retain=False,
+                )
+            logger.debug("Shelly grid power: %.1f W", power)
+            _fast_apply.set()
+        else:
+            logger.warning(
+                "Could not parse Shelly payload: %r", message.payload[:64]
+            )
+
+    mqtt_client = _build_mqtt_client(
+        device_id,
+        on_mode_command,
+        logger,
+        shelly_topic=shelly_topic,
+        on_shelly_power=on_shelly_power if shelly_topic else None,
+    )
+    _client_ref[0] = mqtt_client
     avail_topic = ha_discovery.availability_topic(device_id)
 
     # Publish all HA auto-discovery configs (retained, so HA picks them up)
@@ -335,6 +499,12 @@ def run() -> None:
     for topic, payload in configs:
         mqtt_client.publish(topic, payload, retain=True)
     logger.info("Published %d HA discovery configs", len(configs))
+
+    # Publish Shelly grid-power sensor discovery only when configured
+    if shelly_topic:
+        shelly_disc = ha_discovery.shelly_grid_power_discovery(device_id)
+        mqtt_client.publish(shelly_disc[0], shelly_disc[1], retain=True)
+        logger.info("Published Shelly grid power discovery config")
 
     # Announce online + publish initial mode state
     mqtt_client.publish(avail_topic, "online", retain=True)
@@ -351,6 +521,10 @@ def run() -> None:
         with P18Inverter(port=inverter_port, is_usb=is_usb) as inverter:
             logger.info("Inverter connected")
 
+            # Cache the last successful BMS snapshot so the fast path can use
+            # it between full poll cycles without hitting the RS485 bus.
+            cached_bms: BmsSnapshot | None = None
+
             while True:
                 loop_start = time.monotonic()
 
@@ -358,6 +532,7 @@ def run() -> None:
                 bms: BmsSnapshot | None = None
                 try:
                     bms = bms_poller.read()
+                    cached_bms = bms
                     _publish_bms(mqtt_client, device_id, bms)
                     logger.info(
                         "BMS: SoC=%.1f%% V=%.2fV I=%.1fA",
@@ -376,22 +551,56 @@ def run() -> None:
                     except Exception as exc:
                         logger.error("PV inverter poll failed: %s", exc)
 
-                # 3. Apply the mode last set by HA (or "idle" if no command yet)
-                if bms is not None:
-                    mode = _mode[0]
-                    _apply_mode(inverter, bms, mode, logger)
+                # 3. Apply the effective mode (HA request + peak-shaving override)
+                effective = _effective_mode(
+                    _mode[0],
+                    _latest_grid_w[0],
+                    peak_shave_enabled,
+                    peak_shave_import_w,
+                    peak_shave_hysteresis_w,
+                )
+                if cached_bms is not None:
+                    _apply_mode(inverter, cached_bms, effective, logger)
+                    _last_apply_time[0] = time.monotonic()
                     # Re-publish state so HA stays in sync
                     mqtt_client.publish(
                         ha_discovery.charge_mode_state_topic(device_id),
-                        mode,
+                        effective,
                         retain=True,
                     )
                 else:
                     logger.warning("No BMS data — skipping inverter control this cycle")
 
-                # 4. Sleep remainder of poll interval
+                # 4. Sleep remainder of the poll interval, but wake early when a
+                #    Shelly grid-power reading arrives so we can respond quickly
+                #    to sudden load spikes without waiting for the next full cycle.
                 elapsed = time.monotonic() - loop_start
-                time.sleep(max(0.0, poll_interval - elapsed))
+                remaining = max(0.0, poll_interval - elapsed)
+                _fast_apply.clear()
+                woken_early = _fast_apply.wait(timeout=remaining)
+
+                if woken_early and cached_bms is not None:
+                    now = time.monotonic()
+                    if now - _last_apply_time[0] >= min_apply_interval:
+                        fast_effective = _effective_mode(
+                            _mode[0],
+                            _latest_grid_w[0],
+                            peak_shave_enabled,
+                            peak_shave_import_w,
+                            peak_shave_hysteresis_w,
+                        )
+                        logger.debug(
+                            "Fast-path apply: grid=%.1f W mode=%s",
+                            _latest_grid_w[0] or 0.0,
+                            fast_effective,
+                        )
+                        _apply_mode(inverter, cached_bms, fast_effective, logger)
+                        _last_apply_time[0] = now
+                        mqtt_client.publish(
+                            ha_discovery.charge_mode_state_topic(device_id),
+                            fast_effective,
+                            retain=True,
+                        )
 
     except KeyboardInterrupt:
         logger.info("Controller stopped by user")

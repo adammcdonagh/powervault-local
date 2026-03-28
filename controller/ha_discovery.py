@@ -182,6 +182,23 @@ def charge_mode_select_discovery(device_id: str) -> tuple[str, str]:
     return discovery_topic, json.dumps(payload)
 
 
+def shelly_grid_power_discovery(device_id: str) -> tuple[str, str]:
+    """Build HA discovery config for the Shelly EM grid power sensor.
+
+    Published only when ``SHELLY_GRID_POWER_TOPIC`` is configured, so it
+    does not appear in ``all_discovery_configs``.
+    """
+    defn = _SensorDef(
+        "grid_power",
+        "Grid Power (Shelly)",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+    )
+    return _sensor_discovery(defn, device_id)
+
+
 def all_discovery_configs(device_id: str) -> list[tuple[str, str]]:
     """Return all ``(discovery_topic, json_payload)`` tuples.
 
