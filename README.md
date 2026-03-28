@@ -21,6 +21,7 @@ controller/          Main control loop, HA discovery, BMS safety logic
 p18_serial/          Voltronic P18 serial protocol driver (Iconica inverter)
 pylontech_driver/    Pylontech RS485 BMS driver
 abb_aurora/          ABB UNO PVI 3.0 Aurora RS485 driver (optional)
+poll.py              CLI hardware poll utility (see below)
 tests/               Unit tests
 .env.example         All configuration options with explanations
 docker-compose.yml   Docker deployment
@@ -308,6 +309,67 @@ charge/discharge control:
 > implementation.  Always verify against your firmware before relying on them.
 > Call `normal_mode()` to return to safe defaults if anything behaves
 > unexpectedly.
+
+---
+
+## Hardware poll utility (`poll.py`)
+
+`poll.py` is a standalone CLI tool for testing your hardware connections without
+running the full controller.  It uses the same drivers as the controller and
+prints a formatted summary of readings — useful when connecting USB adapters to
+a laptop or Mac for the first time.
+
+**Install dependencies first:**
+
+```bash
+pip install -r requirements.txt
+```
+
+**Usage — poll any combination of components:**
+
+```bash
+# Pylontech batteries only
+python poll.py --battery /dev/tty.usbserial-0001
+
+# Iconica inverter only (RS-232 / USB-serial adapter)
+python poll.py --inverter /dev/tty.usbserial-0002
+
+# Iconica inverter via the USB HID port on the front panel
+python poll.py --inverter /dev/hidraw0 --inverter-usb
+
+# ABB Aurora PV inverter only
+python poll.py --pv /dev/tty.usbserial-0003
+
+# All three at once
+python poll.py \
+    --battery  /dev/tty.usbserial-0001 \
+    --inverter /dev/tty.usbserial-0002 \
+    --pv       /dev/tty.usbserial-0003
+
+# Poll every 10 seconds (Ctrl-C to stop)
+python poll.py --battery /dev/tty.usbserial-0001 --interval 10
+
+# Machine-readable JSON output
+python poll.py --battery /dev/tty.usbserial-0001 --json
+```
+
+On macOS, USB-serial adapters typically appear as `/dev/tty.usbserial-*` or
+`/dev/tty.usbmodem*`.  Run `ls /dev/tty.usb*` to find yours.  On Linux they
+appear as `/dev/ttyUSB0`, `/dev/ttyUSB1`, etc.
+
+**All options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--battery PORT` | | RS485 port for the Pylontech battery stack |
+| `--battery-modules N` | `1` | Number of Pylontech modules |
+| `--inverter PORT` | | Serial/USB port for the Iconica inverter (P18) |
+| `--inverter-usb` | | Use USB HID mode (inverter front-panel USB port) |
+| `--pv PORT` | | RS485 port for the ABB Aurora PV inverter |
+| `--pv-address N` | `2` | Aurora RS485 device address |
+| `--interval SECS` | *(once)* | Repeat every N seconds |
+| `--json` | | Emit JSON instead of the human-readable table |
+| `--log-level LEVEL` | `WARNING` | Logging verbosity (`DEBUG`, `INFO`, …) |
 
 ---
 
