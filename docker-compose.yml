@@ -1,0 +1,70 @@
+services:
+  controller:
+    build: .
+    container_name: powervault_controller
+    restart: unless-stopped
+    command: ["python", "-m", "controller.main"]
+    # Expose serial/USB ports. Adjust device paths to match your system.
+    # Discover ports with: ls /dev/ttyUSB* /dev/hidraw*
+    devices:
+      - ${INVERTER_PORT:-/dev/ttyUSB0}:${INVERTER_PORT:-/dev/ttyUSB0}
+      - ${BATTERY_PORT:-/dev/ttyUSB1}:${BATTERY_PORT:-/dev/ttyUSB1}
+      # Uncomment when the ABB PV inverter is wired (PV_INVERTER_PORT must also be set):
+      # - ${PV_INVERTER_PORT:-/dev/ttyUSB2}:${PV_INVERTER_PORT:-/dev/ttyUSB2}
+    environment:
+      DEVICE_ID: ${DEVICE_ID:-powervault}
+      POLL_INTERVAL: ${POLL_INTERVAL:-30}
+      # Iconica inverter
+      INVERTER_PORT: ${INVERTER_PORT:-/dev/ttyUSB0}
+      INVERTER_IS_USB: ${INVERTER_IS_USB:-false}
+      # Pylontech batteries
+      BATTERY_PORT: ${BATTERY_PORT:-/dev/ttyUSB1}
+      NUM_BATTERY_MODULES: ${NUM_BATTERY_MODULES:-1}
+      # PV generation (Option A: direct RS485 polling)
+      PV_INVERTER_PORT: ${PV_INVERTER_PORT:-}
+      PV_INVERTER_ADDRESS: ${PV_INVERTER_ADDRESS:-2}
+      # PV generation (Option B: external MQTT topic — overrides Option A when set)
+      PV_GENERATION_TOPIC: ${PV_GENERATION_TOPIC:-}
+      # HA MQTT broker
+      HA_MQTT_HOST: ${HA_MQTT_HOST:-}
+      HA_MQTT_PORT: ${HA_MQTT_PORT:-1883}
+      HA_MQTT_USER: ${HA_MQTT_USER:-}
+      HA_MQTT_PASS: ${HA_MQTT_PASS:-}
+      # Shelly EM grid power
+      SHELLY_GRID_POWER_TOPIC: ${SHELLY_GRID_POWER_TOPIC:-}
+      SHELLY_GRID_POWER_TOPIC_2: ${SHELLY_GRID_POWER_TOPIC_2:-}
+      # Peak-shaving
+      PEAK_SHAVE_ENABLED: ${PEAK_SHAVE_ENABLED:-false}
+      PEAK_SHAVE_IMPORT_W: ${PEAK_SHAVE_IMPORT_W:-0}
+      PEAK_SHAVE_HYSTERESIS_W: ${PEAK_SHAVE_HYSTERESIS_W:-50}
+      PEAK_SHAVE_MIN_APPLY_INTERVAL: ${PEAK_SHAVE_MIN_APPLY_INTERVAL:-2}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+  # ---------------------------------------------------------------------------
+  # poll — one-shot hardware poll utility.
+  #
+  # Only started explicitly (it is NOT included in `docker-compose up -d`).
+  #
+  # poll.py accepts device paths as CLI arguments, so there is no static
+  # devices block here.  Pass through only the port(s) you actually need
+  # using --device on the docker compose run command.
+  #
+  # Use -T to disable pseudo-TTY allocation for clean plain-text output
+  # (without it Docker's PTY layer corrupts ANSI escape codes), e.g.:
+  #
+  #   docker compose run --rm --device /dev/ttyUSB1:/dev/ttyUSB1 poll --battery /dev/ttyUSB1
+  #   docker compose run --rm --device /dev/ttyUSB0:/dev/ttyUSB0 poll --inverter /dev/ttyUSB0
+  #   docker compose run --rm \
+  #       --device /dev/ttyUSB0:/dev/ttyUSB0 \
+  #       --device /dev/ttyUSB1:/dev/ttyUSB1 \
+  #       poll --battery /dev/ttyUSB1 --inverter /dev/ttyUSB0
+  #
+  # Passing no extra args will show the --help text.
+  # ---------------------------------------------------------------------------
+  poll:
+    build: .
+    profiles: ["poll"]
+    entrypoint: ["python", "poll.py"]
+    command: ["--help"]
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
