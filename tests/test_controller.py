@@ -236,7 +236,7 @@ class TestChargeModes:
 # _parse_shelly_power tests
 # ---------------------------------------------------------------------------
 
-from controller.main import _parse_shelly_power, _effective_mode
+from controller.main import _parse_shelly_power, _effective_mode, _compute_grid_total
 
 
 class TestParseShellPower:
@@ -282,6 +282,38 @@ class TestParseShellPower:
     def test_json_no_known_key_returns_none(self):
         payload = json.dumps({"reactive": 50.0}).encode()
         assert _parse_shelly_power(payload) is None
+
+
+# ---------------------------------------------------------------------------
+# _compute_grid_total tests
+# ---------------------------------------------------------------------------
+
+class TestComputeGridTotal:
+    def test_none_when_no_readings(self):
+        assert _compute_grid_total([None, None]) is None
+
+    def test_single_channel_returns_that_value(self):
+        assert _compute_grid_total([1200.0, None]) == pytest.approx(1200.0)
+
+    def test_second_channel_only(self):
+        assert _compute_grid_total([None, 800.0]) == pytest.approx(800.0)
+
+    def test_sums_both_channels(self):
+        assert _compute_grid_total([1200.0, 800.0]) == pytest.approx(2000.0)
+
+    def test_sums_negative_channels(self):
+        # Both fuse boards exporting
+        assert _compute_grid_total([-300.0, -200.0]) == pytest.approx(-500.0)
+
+    def test_mixed_sign_channels(self):
+        # One board importing, the other exporting
+        assert _compute_grid_total([500.0, -200.0]) == pytest.approx(300.0)
+
+    def test_single_element_list(self):
+        assert _compute_grid_total([1000.0]) == pytest.approx(1000.0)
+
+    def test_empty_list_returns_none(self):
+        assert _compute_grid_total([]) is None
 
 
 # ---------------------------------------------------------------------------

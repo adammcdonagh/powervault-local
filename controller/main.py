@@ -48,6 +48,12 @@ for Gen1, or the equivalent Gen2/Gen3 JSON topic).  The controller will:
      within ``PEAK_SHAVE_MIN_APPLY_INTERVAL`` seconds (default 2 s) of the
      reading arriving — far faster than the normal ``POLL_INTERVAL``.
 
+If you have CT clamps on **two** fuse boards, set ``SHELLY_GRID_POWER_TOPIC_2``
+to the second emeter channel topic (e.g.
+``shellies/shellyem-aabbcc/emeter/1/power``).  When both topics are
+configured the controller sums the two readings so that ``grid_power``
+represents the total import/export across both boards.
+
 Note: the Shelly CT clamp plugs into the Shelly EM hardware device, which
 connects to your WiFi network.  The CT clamp cannot be wired directly to
 the Raspberry Pi GPIO pins.
@@ -83,8 +89,10 @@ Environment variables
   POLL_INTERVAL         Seconds between full BMS/PV polling cycles (default 30)
   INVERTER_IS_USB       Set to "true" if using USB HID port (default false)
 
-  SHELLY_GRID_POWER_TOPIC   MQTT topic for Shelly EM grid power readings
+  SHELLY_GRID_POWER_TOPIC   MQTT topic for Shelly EM channel 1 grid power readings
                              (leave unset to disable Shelly integration)
+  SHELLY_GRID_POWER_TOPIC_2 MQTT topic for Shelly EM channel 2 grid power readings
+                             (optional; when set, grid power = ch1 + ch2)
   PEAK_SHAVE_ENABLED         Set to "true" to enable automatic peak-shaving
   PEAK_SHAVE_IMPORT_W        Grid import threshold in W above which discharge
                              is triggered automatically (default 0)
@@ -180,6 +188,16 @@ def _parse_shelly_power(payload: bytes) -> float | None:
     return None
 
 
+def _compute_grid_total(readings: list[float | None]) -> float | None:
+    """Sum all non-None per-channel power readings.
+
+    Returns *None* if no channel has received a reading yet, so the caller
+    can distinguish "no data" from "zero watts".
+    """
+    values = [v for v in readings if v is not None]
+    return sum(values) if values else None
+
+
 def _effective_mode(
     requested: str,
     grid_w: float | None,
@@ -228,13 +246,15 @@ def _build_mqtt_client(
     logger: logging.Logger,
     shelly_topic: str = "",
     on_shelly_power: object = None,
+    shelly_topic_2: str = "",
+    on_shelly_power_2: object = None,
 ) -> mqtt.Client:
     """Build, configure and connect the MQTT client.
 
     Sets up:
     - Last Will and Testament (publishes "offline" on unexpected disconnect)
     - ``on_connect`` handler that resubscribes to the mode command topic and,
-      if configured, the Shelly grid-power topic
+      if configured, the Shelly grid-power topic(s)
     - ``on_message`` handler that routes mode-command and Shelly messages
     """
     cmd_topic = ha_discovery.charge_mode_command_topic(device_id)
@@ -257,7 +277,10 @@ def _build_mqtt_client(
             logger.info("MQTT connected — subscribed to %s", cmd_topic)
             if shelly_topic:
                 client.subscribe(shelly_topic)
-                logger.info("Subscribed to Shelly topic: %s", shelly_topic)
+                logger.info("Subscribed to Shelly topic 1: %s", shelly_topic)
+            if shelly_topic_2:
+                client.subscribe(shelly_topic_2)
+                logger.info("Subscribed to Shelly topic 2: %s", shelly_topic_2)
         else:
             logger.error("MQTT connect failed: %s", reason_code)
 
@@ -270,6 +293,8 @@ def _build_mqtt_client(
             on_mode_command(client, message)
         elif shelly_topic and message.topic == shelly_topic and on_shelly_power:
             on_shelly_power(message)
+        elif shelly_topic_2 and message.topic == shelly_topic_2 and on_shelly_power_2:
+            on_shelly_power_2(message)
 
     client.on_connect = on_connect
     client.on_message = on_message
@@ -424,6 +449,7 @@ def run() -> None:
 
     # Shelly EM / peak-shaving configuration
     shelly_topic = _env("SHELLY_GRID_POWER_TOPIC", "")
+    shelly_topic_2 = _env("SHELLY_GRID_POWER_TOPIC_2", "")
     peak_shave_enabled = _env_bool("PEAK_SHAVE_ENABLED", False)
     peak_shave_import_w = _env_float("PEAK_SHAVE_IMPORT_W", 0.0)
     peak_shave_hysteresis_w = _env_float("PEAK_SHAVE_HYSTERESIS_W", 50.0)
@@ -437,7 +463,12 @@ def run() -> None:
         logger.info("  PV inverter: %s (address %d)", pv_port, pv_address)
     else:
         logger.info("  PV inverter: disabled (set PV_INVERTER_PORT to enable)")
-    if shelly_topic:
+    if shelly_topic and shelly_topic_2:
+        logger.info(
+            "  Shelly grid: ch1=%s ch2=%s (summed, peak_shave=%s)",
+            shelly_topic, shelly_topic_2, peak_shave_enabled,
+        )
+    elif shelly_topic:
         logger.info("  Shelly grid: %s (peak_shave=%s)", shelly_topic, peak_shave_enabled)
     else:
         logger.info("  Shelly grid: disabled (set SHELLY_GRID_POWER_TOPIC to enable)")
@@ -446,11 +477,13 @@ def run() -> None:
     # One-element lists are used so closures can mutate them.
     _mode: list[str] = ["idle"]
     _latest_grid_w: list[float | None] = [None]
+    # Per-channel Shelly readings; index 0 = topic 1, index 1 = topic 2.
+    _shelly_channels: list[float | None] = [None, None]
     # Timestamp of the last inverter command (monotonic); used for fast-path debounce.
     _last_apply_time: list[float] = [0.0]
     # Event set by the Shelly MQTT callback to wake the main loop early.
     _fast_apply = threading.Event()
-    # Forward reference so on_shelly_power can publish via the MQTT client.
+    # Forward reference so Shelly handlers can publish via the MQTT client.
     _client_ref: list[mqtt.Client | None] = [None]
 
     def on_mode_command(client: mqtt.Client, message: mqtt.MQTTMessage) -> None:
@@ -467,29 +500,48 @@ def run() -> None:
         else:
             logger.warning("Unknown charge mode received: %r (ignored)", mode)
 
-    def on_shelly_power(message: mqtt.MQTTMessage) -> None:
-        power = _parse_shelly_power(message.payload)
-        if power is not None:
-            _latest_grid_w[0] = power
-            if _client_ref[0] is not None:
-                _client_ref[0].publish(
-                    _sensor_topic(device_id, "grid_power"),
-                    str(round(power, 1)),
-                    retain=False,
+    def _make_shelly_handler(channel_idx: int):
+        """Return an MQTT message handler for the given Shelly channel index."""
+        def handler(message: mqtt.MQTTMessage) -> None:
+            power = _parse_shelly_power(message.payload)
+            if power is not None:
+                _shelly_channels[channel_idx] = power
+                total = _compute_grid_total(_shelly_channels)
+                _latest_grid_w[0] = total
+                if _client_ref[0] is not None and total is not None:
+                    _client_ref[0].publish(
+                        _sensor_topic(device_id, "grid_power"),
+                        str(round(total, 1)),
+                        retain=False,
+                    )
+                logger.debug(
+                    "Shelly ch%d: %.1f W (ch1=%s, ch2=%s, total=%.1f W)",
+                    channel_idx + 1,
+                    power,
+                    f"{_shelly_channels[0]:.1f}" if _shelly_channels[0] is not None else "—",
+                    f"{_shelly_channels[1]:.1f}" if _shelly_channels[1] is not None else "—",
+                    total if total is not None else 0.0,
                 )
-            logger.debug("Shelly grid power: %.1f W", power)
-            _fast_apply.set()
-        else:
-            logger.warning(
-                "Could not parse Shelly payload: %r", message.payload[:64]
-            )
+                _fast_apply.set()
+            else:
+                logger.warning(
+                    "Could not parse Shelly payload (ch%d): %r",
+                    channel_idx + 1,
+                    message.payload[:64],
+                )
+        return handler
+
+    on_shelly_ch1 = _make_shelly_handler(0) if shelly_topic else None
+    on_shelly_ch2 = _make_shelly_handler(1) if shelly_topic_2 else None
 
     mqtt_client = _build_mqtt_client(
         device_id,
         on_mode_command,
         logger,
         shelly_topic=shelly_topic,
-        on_shelly_power=on_shelly_power if shelly_topic else None,
+        on_shelly_power=on_shelly_ch1,
+        shelly_topic_2=shelly_topic_2,
+        on_shelly_power_2=on_shelly_ch2,
     )
     _client_ref[0] = mqtt_client
     avail_topic = ha_discovery.availability_topic(device_id)
