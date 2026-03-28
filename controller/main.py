@@ -4,29 +4,44 @@ This is the entry point for the fully independent local control stack.
 It replaces the dependency on the M4 controller's MQTT broker by talking
 directly to the hardware:
 
-  Pylontech batteries  ← RS485   → /dev/ttyUSB1 (python-pylontech)
+  Pylontech batteries  ← RS485    → /dev/ttyUSB1 (python-pylontech)
   Iconica inverter     ← USB/RS232 → /dev/ttyUSB0 (p18_serial)
-  ABB UNO PVI 3.0      ← RS485   → /dev/ttyUSB2 (aurorapy) [optional]
+  ABB UNO PVI 3.0      ← RS485    → /dev/ttyUSB2 (aurorapy) [optional]
 
-The controller loop:
-  1. Polls the Pylontech BMS for SoC, voltage, current, health and limits
-  2. Polls the ABB PV inverter for solar production (if configured)
-  3. Applies BMS limits to the Iconica inverter
-  4. Decides charge/discharge mode via the scheduler
-  5. Issues the appropriate P18 command to the inverter
-  6. Publishes all sensor readings to HA via MQTT (auto-discovery)
+Control model
+-------------
+The charge mode is set externally via a Home Assistant MQTT ``select``
+entity.  HA publishes one of the five mode strings to the command topic:
+
+  powervault/{device_id}/control/charge_mode/set
+
+The controller subscribes to this topic, updates its in-memory mode, and
+on every poll cycle applies that mode to the inverter (with BMS safety
+checks).  The current mode is reflected back on the state topic:
+
+  powervault/{device_id}/control/charge_mode/state
+
+On startup the controller publishes HA MQTT auto-discovery configs for all
+sensors (BMS, PV inverter) and the charge-mode select entity, so entities
+appear in HA automatically without any manual YAML.
+
+Charge modes
+------------
+  idle          – hold battery (neither charge nor discharge)
+  charge        – charge from grid/solar (soft ceiling check)
+  discharge     – discharge to supply load (soft floor check)
+  force_charge  – maximum grid charge (bypasses ceiling)
+  force_discharge – maximum discharge (bypasses ceiling, floor applies)
+
+BMS safety checks always apply and will revert to idle if violated.
 
 Run directly:
   python -m controller.main
 
-Or via docker-compose with the ``controller`` service.
+Or via docker-compose with the ``controller`` profile.
 
 Environment variables
 ---------------------
-All hardware ports and MQTT settings are read from environment variables
-(see .env.example for the full list).
-
-Required:
   INVERTER_PORT         Serial/USB port for the Iconica inverter
   BATTERY_PORT          RS485 port for the Pylontech batteries
   NUM_BATTERY_MODULES   Number of Pylontech modules in the stack
@@ -36,7 +51,6 @@ Required:
   HA_MQTT_USER          HA broker username (optional)
   HA_MQTT_PASS          HA broker password (optional)
 
-Optional:
   PV_INVERTER_PORT      RS485 port for the ABB Aurora PV inverter
                         (leave unset to disable PV inverter polling)
   PV_INVERTER_ADDRESS   Aurora RS485 address (default 2)
@@ -57,16 +71,14 @@ from dotenv import load_dotenv
 from pylontech_driver.bms import BmsPoller, BmsSnapshot
 from abb_aurora.aurora import AbbAuroraPoller, AuroraSnapshot
 from p18_serial.p18 import P18Inverter
-from controller.safety import SafetyError, apply_bms_limits, check_charge_allowed, check_discharge_allowed
-from controller.scheduler import decide_mode
-
-load_dotenv()
-
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+from controller.safety import (
+    SafetyError,
+    apply_bms_limits,
+    check_charge_allowed,
+    check_discharge_allowed,
 )
-logger = logging.getLogger(__name__)
+from controller import ha_discovery
+from controller.ha_discovery import CHARGE_MODES
 
 
 # ---------------------------------------------------------------------------
@@ -94,15 +106,58 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# MQTT publisher
+# MQTT client factory
 # ---------------------------------------------------------------------------
 
-def _build_mqtt_client() -> mqtt.Client:
+def _build_mqtt_client(
+    device_id: str,
+    on_mode_command: object,
+    logger: logging.Logger,
+) -> mqtt.Client:
+    """Build, configure and connect the MQTT client.
+
+    Sets up:
+    - Last Will and Testament (publishes "offline" on unexpected disconnect)
+    - ``on_connect`` handler that resubscribes to the mode command topic
+    - ``on_message`` handler that calls *on_mode_command* for mode changes
+    """
+    cmd_topic = ha_discovery.charge_mode_command_topic(device_id)
+    avail_topic = ha_discovery.availability_topic(device_id)
+
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+
+    # LWT: HA will mark all entities unavailable if we disconnect unexpectedly
+    client.will_set(avail_topic, "offline", retain=True)
+
+    def on_connect(
+        client: mqtt.Client,
+        userdata: object,
+        flags: object,
+        reason_code: object,
+        properties: object = None,
+    ) -> None:
+        if str(reason_code) == "Success":
+            client.subscribe(cmd_topic)
+            logger.info("MQTT connected — subscribed to %s", cmd_topic)
+        else:
+            logger.error("MQTT connect failed: %s", reason_code)
+
+    def on_message(
+        client: mqtt.Client,
+        userdata: object,
+        message: mqtt.MQTTMessage,
+    ) -> None:
+        if message.topic == cmd_topic:
+            on_mode_command(client, message)
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+
     user = _env("HA_MQTT_USER")
     password = _env("HA_MQTT_PASS")
     if user:
         client.username_pw_set(user, password or None)
+
     client.connect(
         _env("HA_MQTT_HOST", "localhost"),
         _env_int("HA_MQTT_PORT", 1883),
@@ -111,8 +166,12 @@ def _build_mqtt_client() -> mqtt.Client:
     return client
 
 
-def _topic(device_id: str, name: str) -> str:
-    return f"powervault/{device_id}/sensor/{name}/state"
+# ---------------------------------------------------------------------------
+# MQTT publishers
+# ---------------------------------------------------------------------------
+
+def _sensor_topic(device_id: str, name: str) -> str:
+    return ha_discovery.sensor_state_topic(device_id, name)
 
 
 def _publish_bms(client: mqtt.Client, device_id: str, snap: BmsSnapshot) -> None:
@@ -141,7 +200,7 @@ def _publish_bms(client: mqtt.Client, device_id: str, snap: BmsSnapshot) -> None
         readings["bms_discharge_voltage_limit"] = round(snap.discharge_voltage_limit_v, 2)
 
     for name, value in readings.items():
-        client.publish(_topic(device_id, name), str(value), retain=True)
+        client.publish(_sensor_topic(device_id, name), str(value), retain=True)
 
 
 def _publish_pv(client: mqtt.Client, device_id: str, snap: AuroraSnapshot) -> None:
@@ -169,19 +228,24 @@ def _publish_pv(client: mqtt.Client, device_id: str, snap: AuroraSnapshot) -> No
         readings["pv_state"] = snap.inverter_state
 
     for name, value in readings.items():
-        client.publish(_topic(device_id, name), str(value), retain=True)
-
-
-def _publish_mode(client: mqtt.Client, device_id: str, mode: str) -> None:
-    client.publish(_topic(device_id, "battery_mode"), mode, retain=True)
+        client.publish(_sensor_topic(device_id, name), str(value), retain=True)
 
 
 # ---------------------------------------------------------------------------
-# Main control loop
+# Inverter mode application (with BMS safety)
 # ---------------------------------------------------------------------------
 
-def _apply_mode(inverter: P18Inverter, bms: BmsSnapshot, mode: str) -> None:
-    """Apply the scheduler-decided mode to the inverter, with safety checks."""
+def _apply_mode(
+    inverter: P18Inverter,
+    bms: BmsSnapshot,
+    mode: str,
+    logger: logging.Logger,
+) -> None:
+    """Apply *mode* to the inverter, respecting BMS limits and safety checks.
+
+    Falls back to idle if the BMS limits are unavailable or a safety check
+    blocks the requested mode.
+    """
     try:
         apply_bms_limits(inverter, bms)
     except SafetyError as exc:
@@ -201,9 +265,9 @@ def _apply_mode(inverter: P18Inverter, bms: BmsSnapshot, mode: str) -> None:
         elif mode == "force_discharge":
             check_discharge_allowed(bms)
             inverter.normal_mode()
-        else:  # idle
+        else:  # idle (default / unknown)
             inverter.idle_mode()
-        logger.info("Inverter mode set: %s", mode)
+        logger.info("Inverter mode applied: %s", mode)
     except SafetyError as exc:
         logger.warning("Mode %r blocked by safety: %s — going idle", mode, exc)
         inverter.idle_mode()
@@ -211,8 +275,20 @@ def _apply_mode(inverter: P18Inverter, bms: BmsSnapshot, mode: str) -> None:
         logger.error("Failed to apply mode %r to inverter: %s", mode, exc)
 
 
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
 def run() -> None:
-    """Main polling and control loop. Runs indefinitely."""
+    """Main polling and control loop — runs indefinitely."""
+    load_dotenv()
+
+    logging.basicConfig(
+        level=_env("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    logger = logging.getLogger(__name__)
+
     device_id = _env("DEVICE_ID", "powervault")
     poll_interval = _env_int("POLL_INTERVAL", 30)
 
@@ -226,14 +302,47 @@ def run() -> None:
     pv_address = _env_int("PV_INVERTER_ADDRESS", 2)
 
     logger.info("Starting M4-bypass controller (device_id=%s)", device_id)
-    logger.info("  Inverter:  %s (usb=%s)", inverter_port, is_usb)
-    logger.info("  Batteries: %s (%d modules)", battery_port, num_modules)
+    logger.info("  Inverter:    %s (usb=%s)", inverter_port, is_usb)
+    logger.info("  Batteries:   %s (%d modules)", battery_port, num_modules)
     if pv_port:
         logger.info("  PV inverter: %s (address %d)", pv_port, pv_address)
     else:
         logger.info("  PV inverter: disabled (set PV_INVERTER_PORT to enable)")
 
-    mqtt_client = _build_mqtt_client()
+    # --- Thread-safe mode storage (written by MQTT callback, read by main loop) ---
+    # A one-element list is used so the closure in on_mode_command can mutate it.
+    _mode: list[str] = ["idle"]
+
+    def on_mode_command(client: mqtt.Client, message: mqtt.MQTTMessage) -> None:
+        mode = message.payload.decode().strip().lower()
+        if mode in CHARGE_MODES:
+            _mode[0] = mode
+            logger.info("Charge mode command received: %s", mode)
+            # Immediately reflect the new state back to HA
+            client.publish(
+                ha_discovery.charge_mode_state_topic(device_id),
+                mode,
+                retain=True,
+            )
+        else:
+            logger.warning("Unknown charge mode received: %r (ignored)", mode)
+
+    mqtt_client = _build_mqtt_client(device_id, on_mode_command, logger)
+    avail_topic = ha_discovery.availability_topic(device_id)
+
+    # Publish all HA auto-discovery configs (retained, so HA picks them up)
+    configs = ha_discovery.all_discovery_configs(device_id)
+    for topic, payload in configs:
+        mqtt_client.publish(topic, payload, retain=True)
+    logger.info("Published %d HA discovery configs", len(configs))
+
+    # Announce online + publish initial mode state
+    mqtt_client.publish(avail_topic, "online", retain=True)
+    mqtt_client.publish(
+        ha_discovery.charge_mode_state_topic(device_id),
+        _mode[0],
+        retain=True,
+    )
 
     bms_poller = BmsPoller(port=battery_port, num_modules=num_modules)
     pv_poller = AbbAuroraPoller(port=pv_port, address=pv_address) if pv_port else None
@@ -245,7 +354,7 @@ def run() -> None:
             while True:
                 loop_start = time.monotonic()
 
-                # --- 1. Read battery BMS ---
+                # 1. Read battery BMS
                 bms: BmsSnapshot | None = None
                 try:
                     bms = bms_poller.read()
@@ -259,8 +368,7 @@ def run() -> None:
                 except Exception as exc:
                     logger.error("BMS poll failed: %s", exc)
 
-                # --- 2. Read PV inverter ---
-                pv: AuroraSnapshot | None = None
+                # 2. Read PV inverter (optional)
                 if pv_poller is not None:
                     try:
                         pv = pv_poller.read()
@@ -268,28 +376,29 @@ def run() -> None:
                     except Exception as exc:
                         logger.error("PV inverter poll failed: %s", exc)
 
-                # --- 3. Decide and apply mode ---
+                # 3. Apply the mode last set by HA (or "idle" if no command yet)
                 if bms is not None:
-                    pv_snap = pv if pv is not None else AuroraSnapshot()
-                    # House power: we don't have a CT here yet; use battery
-                    # discharge power as a proxy until PZEM-004T is wired.
-                    # Negative battery power means discharging (supplying house).
-                    house_proxy_w = max(0.0, -bms.battery_power_w)
-
-                    mode = decide_mode(bms, pv_snap, house_proxy_w)
-                    _apply_mode(inverter, bms, mode)
-                    _publish_mode(mqtt_client, device_id, mode)
+                    mode = _mode[0]
+                    _apply_mode(inverter, bms, mode, logger)
+                    # Re-publish state so HA stays in sync
+                    mqtt_client.publish(
+                        ha_discovery.charge_mode_state_topic(device_id),
+                        mode,
+                        retain=True,
+                    )
                 else:
                     logger.warning("No BMS data — skipping inverter control this cycle")
 
-                # --- 4. Sleep remainder of poll interval ---
+                # 4. Sleep remainder of poll interval
                 elapsed = time.monotonic() - loop_start
-                sleep_time = max(0.0, poll_interval - elapsed)
-                time.sleep(sleep_time)
+                time.sleep(max(0.0, poll_interval - elapsed))
 
     except KeyboardInterrupt:
         logger.info("Controller stopped by user")
     finally:
+        # Mark all entities unavailable in HA before exiting
+        mqtt_client.publish(avail_topic, "offline", retain=True)
+        time.sleep(0.5)  # allow last message to flush before disconnect
         bms_poller.close()
         if pv_poller is not None:
             pv_poller.close()
@@ -299,3 +408,4 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
+

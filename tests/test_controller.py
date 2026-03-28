@@ -1,11 +1,10 @@
-"""Unit tests for controller.safety and controller.scheduler."""
+"""Unit tests for controller.safety and controller.ha_discovery."""
 
+import json
 import pytest
-from datetime import datetime, time
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 from pylontech_driver.bms import BmsSnapshot, ModuleData
-from abb_aurora.aurora import AuroraSnapshot
 from controller.safety import (
     SafetyError,
     apply_bms_limits,
@@ -14,7 +13,8 @@ from controller.safety import (
     MAX_CHARGE_SOC_PCT,
     MIN_DISCHARGE_SOC_PCT,
 )
-from controller.scheduler import decide_mode, _in_cheap_window
+from controller import ha_discovery
+from controller.ha_discovery import CHARGE_MODES
 
 
 # ---------------------------------------------------------------------------
@@ -46,12 +46,6 @@ def _bms(
     )
     from pylontech_driver.bms import _aggregate
     return _aggregate([mod])
-
-
-def _pv(ac_power=0.0, producing=False) -> AuroraSnapshot:
-    snap = AuroraSnapshot(ac_power_w=ac_power)
-    snap.is_producing = producing
-    return snap
 
 
 # ---------------------------------------------------------------------------
@@ -120,112 +114,149 @@ class TestCheckDischargeAllowed:
 
 
 # ---------------------------------------------------------------------------
-# Scheduler tests
+# HA discovery tests
 # ---------------------------------------------------------------------------
 
-class TestInCheapWindow:
-    def test_in_window(self):
-        assert _in_cheap_window(time(1, 0), time(0, 30), time(4, 30))
-
-    def test_at_window_start(self):
-        assert _in_cheap_window(time(0, 30), time(0, 30), time(4, 30))
-
-    def test_at_window_end_is_exclusive(self):
-        assert not _in_cheap_window(time(4, 30), time(0, 30), time(4, 30))
-
-    def test_outside_window(self):
-        assert not _in_cheap_window(time(10, 0), time(0, 30), time(4, 30))
-
-    def test_midnight_wrap(self):
-        # 23:30 → 04:30 wrapping window
-        assert _in_cheap_window(time(23, 45), time(23, 30), time(4, 30))
-        assert _in_cheap_window(time(0, 0), time(23, 30), time(4, 30))
-        assert not _in_cheap_window(time(10, 0), time(23, 30), time(4, 30))
+DEVICE_ID = "testdev"
 
 
-class TestDecideMode:
-    # --- Safety floor ---
-    def test_force_charge_at_soc_floor(self):
-        bms = _bms(soc=15.0)  # == MIN_DISCHARGE_SOC_PCT
-        mode = decide_mode(bms, _pv(), 500.0, now=datetime(2024, 1, 15, 14, 0))
-        assert mode == "force_charge"
+class TestAllDiscoveryConfigs:
+    def test_returns_non_empty_list(self):
+        configs = ha_discovery.all_discovery_configs(DEVICE_ID)
+        assert isinstance(configs, list)
+        assert len(configs) > 0
 
-    def test_force_charge_below_soc_floor(self):
-        bms = _bms(soc=10.0)
-        mode = decide_mode(bms, _pv(), 500.0, now=datetime(2024, 1, 15, 14, 0))
-        assert mode == "force_charge"
+    def test_all_payloads_are_valid_json(self):
+        for _, payload_str in ha_discovery.all_discovery_configs(DEVICE_ID):
+            payload = json.loads(payload_str)
+            assert isinstance(payload, dict)
 
-    # --- Cheap tariff window ---
-    def test_charges_during_cheap_when_below_target(self):
-        bms = _bms(soc=60.0)  # below 90% target
-        mode = decide_mode(
-            bms, _pv(), 500.0,
-            now=datetime(2024, 1, 15, 2, 0),  # 02:00, inside cheap window
-        )
-        assert mode == "charge"
+    def test_all_payloads_have_required_ha_fields(self):
+        for _, payload_str in ha_discovery.all_discovery_configs(DEVICE_ID):
+            payload = json.loads(payload_str)
+            assert "name" in payload
+            assert "unique_id" in payload
+            assert "state_topic" in payload
+            assert "device" in payload
+            assert "availability_topic" in payload
 
-    def test_idle_during_cheap_when_at_target(self):
-        bms = _bms(soc=91.0)  # above 90% target
-        mode = decide_mode(
-            bms, _pv(), 500.0,
-            now=datetime(2024, 1, 15, 2, 0),
-        )
-        assert mode == "idle"
+    def test_all_availability_topics_match_device(self):
+        expected = ha_discovery.availability_topic(DEVICE_ID)
+        for _, payload_str in ha_discovery.all_discovery_configs(DEVICE_ID):
+            payload = json.loads(payload_str)
+            assert payload["availability_topic"] == expected
 
-    # --- Daytime, solar available ---
-    def test_charges_from_pv_when_excess_solar_and_battery_not_full(self):
-        bms = _bms(soc=70.0)
-        pv = _pv(ac_power=3000.0, producing=True)
-        mode = decide_mode(
-            bms, pv, house_power_w=1500.0,
-            now=datetime(2024, 6, 15, 12, 0),  # midday
-        )
-        assert mode == "charge"
+    def test_unique_ids_are_globally_unique(self):
+        configs = ha_discovery.all_discovery_configs(DEVICE_ID)
+        unique_ids = [json.loads(p)["unique_id"] for _, p in configs]
+        assert len(unique_ids) == len(set(unique_ids))
 
-    def test_idle_when_excess_solar_and_battery_full(self):
-        bms = _bms(soc=92.0)  # above target
-        pv = _pv(ac_power=3000.0, producing=True)
-        mode = decide_mode(
-            bms, pv, house_power_w=1500.0,
-            now=datetime(2024, 6, 15, 12, 0),
-        )
-        assert mode == "idle"
+    def test_discovery_topics_are_globally_unique(self):
+        configs = ha_discovery.all_discovery_configs(DEVICE_ID)
+        topics = [t for t, _ in configs]
+        assert len(topics) == len(set(topics))
 
-    def test_discharges_when_solar_less_than_house_demand(self):
-        bms = _bms(soc=80.0)
-        pv = _pv(ac_power=800.0, producing=True)
-        mode = decide_mode(
-            bms, pv, house_power_w=2000.0,
-            now=datetime(2024, 6, 15, 12, 0),
-        )
-        assert mode == "discharge"
+    def test_charge_mode_select_is_included(self):
+        configs = ha_discovery.all_discovery_configs(DEVICE_ID)
+        select_topics = [t for t, _ in configs if t.startswith("homeassistant/select/")]
+        assert len(select_topics) == 1
 
-    # --- Night, no PV ---
-    def test_discharges_at_night_with_soc_above_floor(self):
-        bms = _bms(soc=60.0)
-        mode = decide_mode(
-            bms, _pv(producing=False), house_power_w=500.0,
-            now=datetime(2024, 1, 15, 22, 0),  # 22:00, outside cheap window
-        )
-        assert mode == "discharge"
+    def test_bms_soc_sensor_included(self):
+        configs = ha_discovery.all_discovery_configs(DEVICE_ID)
+        topics = [t for t, _ in configs]
+        assert any("battery_soc" in t for t in topics)
 
-    def test_force_charge_at_night_at_soc_floor(self):
-        bms = _bms(soc=MIN_DISCHARGE_SOC_PCT)
-        # The floor check runs first so this returns force_charge
-        mode = decide_mode(
-            bms, _pv(producing=False), house_power_w=500.0,
-            now=datetime(2024, 1, 15, 22, 0),
-        )
-        # At exactly the floor the safety guard fires first
-        assert mode == "force_charge"
+    def test_pv_power_sensor_included(self):
+        configs = ha_discovery.all_discovery_configs(DEVICE_ID)
+        topics = [t for t, _ in configs]
+        assert any("pv_ac_power" in t for t in topics)
 
-    def test_uses_env_var_cheap_start(self):
-        """CHEAP_START env var changes the cheap window."""
-        bms = _bms(soc=50.0)
-        with patch.dict("os.environ", {"CHEAP_START": "01:00", "CHEAP_END": "05:00"}):
-            mode = decide_mode(
-                bms, _pv(), 500.0,
-                now=datetime(2024, 1, 15, 0, 30),  # 00:30 — before new window
-            )
-        # 00:30 is outside 01:00–05:00 so it should fall through to night discharge
-        assert mode == "discharge"
+    def test_binary_sensor_for_pv_producing(self):
+        configs = ha_discovery.all_discovery_configs(DEVICE_ID)
+        binary_topics = [t for t, _ in configs if t.startswith("homeassistant/binary_sensor/")]
+        assert len(binary_topics) >= 1
+        assert any("pv_producing" in t for t in binary_topics)
+
+    def test_device_id_scoped_unique_ids(self):
+        """Unique IDs from two different device IDs must not clash."""
+        ids_a = {json.loads(p)["unique_id"] for _, p in ha_discovery.all_discovery_configs("devA")}
+        ids_b = {json.loads(p)["unique_id"] for _, p in ha_discovery.all_discovery_configs("devB")}
+        assert ids_a.isdisjoint(ids_b)
+
+
+class TestChargeModeSelectDiscovery:
+    def test_returns_select_component_topic(self):
+        topic, _ = ha_discovery.charge_mode_select_discovery(DEVICE_ID)
+        assert topic.startswith("homeassistant/select/")
+
+    def test_all_charge_modes_present(self):
+        _, payload_str = ha_discovery.charge_mode_select_discovery(DEVICE_ID)
+        payload = json.loads(payload_str)
+        assert set(payload["options"]) == set(CHARGE_MODES)
+
+    def test_command_topic_correct(self):
+        _, payload_str = ha_discovery.charge_mode_select_discovery(DEVICE_ID)
+        payload = json.loads(payload_str)
+        assert payload["command_topic"] == ha_discovery.charge_mode_command_topic(DEVICE_ID)
+
+    def test_state_topic_correct(self):
+        _, payload_str = ha_discovery.charge_mode_select_discovery(DEVICE_ID)
+        payload = json.loads(payload_str)
+        assert payload["state_topic"] == ha_discovery.charge_mode_state_topic(DEVICE_ID)
+
+    def test_command_and_state_topics_differ(self):
+        _, payload_str = ha_discovery.charge_mode_select_discovery(DEVICE_ID)
+        payload = json.loads(payload_str)
+        assert payload["command_topic"] != payload["state_topic"]
+
+    def test_payload_has_device_block(self):
+        _, payload_str = ha_discovery.charge_mode_select_discovery(DEVICE_ID)
+        payload = json.loads(payload_str)
+        assert "device" in payload
+        assert "identifiers" in payload["device"]
+
+
+class TestChargeModes:
+    def test_five_modes(self):
+        assert len(CHARGE_MODES) == 5
+
+    def test_idle_present(self):
+        assert "idle" in CHARGE_MODES
+
+    def test_force_modes_present(self):
+        assert "force_charge" in CHARGE_MODES
+        assert "force_discharge" in CHARGE_MODES
+
+    def test_all_modes_lowercase(self):
+        for mode in CHARGE_MODES:
+            assert mode == mode.lower()
+
+
+class TestTopicHelpers:
+    def test_sensor_state_topic_contains_device_and_name(self):
+        topic = ha_discovery.sensor_state_topic(DEVICE_ID, "battery_soc")
+        assert DEVICE_ID in topic
+        assert "battery_soc" in topic
+
+    def test_charge_mode_command_topic_contains_device(self):
+        topic = ha_discovery.charge_mode_command_topic(DEVICE_ID)
+        assert DEVICE_ID in topic
+
+    def test_charge_mode_state_topic_contains_device(self):
+        topic = ha_discovery.charge_mode_state_topic(DEVICE_ID)
+        assert DEVICE_ID in topic
+
+    def test_command_and_state_topics_differ(self):
+        cmd = ha_discovery.charge_mode_command_topic(DEVICE_ID)
+        state = ha_discovery.charge_mode_state_topic(DEVICE_ID)
+        assert cmd != state
+
+    def test_availability_topic_contains_device(self):
+        topic = ha_discovery.availability_topic(DEVICE_ID)
+        assert DEVICE_ID in topic
+
+    def test_availability_differs_from_sensor_topics(self):
+        avail = ha_discovery.availability_topic(DEVICE_ID)
+        sensor = ha_discovery.sensor_state_topic(DEVICE_ID, "battery_soc")
+        assert avail != sensor
+

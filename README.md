@@ -314,7 +314,7 @@ pip install -r requirements.txt
 python -m pytest tests/ -v
 ```
 
-All 144 tests should pass.
+All 156 tests should pass.
 
 ---
 
