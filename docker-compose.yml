@@ -1,0 +1,21 @@
+services:
+  pv3_bridge:
+    build: .
+    container_name: pv3_bridge
+    restart: unless-stopped
+    environment:
+      P3_HOST: ${P3_HOST:-192.168.1.215}
+      P3_MQTT_PORT: ${P3_MQTT_PORT:-1883}
+      P3_DEVICE_ID: ${P3_DEVICE_ID:-PV001001DEV}
+      HA_MQTT_HOST: ${HA_MQTT_HOST:-}
+      HA_MQTT_PORT: ${HA_MQTT_PORT:-1883}
+      HA_MQTT_USER: ${HA_MQTT_USER:-}
+      HA_MQTT_PASS: ${HA_MQTT_PASS:-}
+      M4_SSH_HOST: ${M4_SSH_HOST:-}
+      M4_SSH_PORT: ${M4_SSH_PORT:-22}
+      M4_SSH_USER: ${M4_SSH_USER:-root}
+      M4_SSH_KEY_FILE: ${M4_SSH_KEY_FILE:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      # Mount SSH key if using key-based auth for schedule control
+      - ${M4_SSH_KEY_FILE:-/dev/null}:${M4_SSH_KEY_FILE:-/dev/null}:ro

@@ -1,0 +1,8 @@
+paho-mqtt>=2.0.0
+paramiko>=3.0.0
+python-dotenv>=1.0.0
+pyserial>=3.5
+
+# Testing
+pytest>=7.4
+pytest-mock>=3.12

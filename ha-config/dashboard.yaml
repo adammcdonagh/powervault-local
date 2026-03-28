@@ -1,0 +1,191 @@
+# Powervault P3 — Lovelace Dashboard
+#
+# How to use:
+# 1. In Home Assistant, go to Settings → Dashboards → Add Dashboard
+# 2. Create a new dashboard (or open an existing one)
+# 3. Click the three-dot menu → Edit → Raw configuration editor
+# 4. Paste the content of this file
+#
+# Prerequisites: all sensors from mqtt_sensors.yaml and pylontech_sensors.yaml
+# must already be configured. Replace "PV001001DEV" with your device ID.
+#
+# Optional: install "Power Flow Card Plus" from HACS for the energy flow card.
+
+title: Powervault P3
+views:
+  - title: Overview
+    path: pv3-overview
+    icon: mdi:battery-charging
+    cards:
+
+      # ---- Power flow summary row ----
+      - type: horizontal-stack
+        cards:
+          - type: entity
+            entity: sensor.pv3_battery_soc
+            name: Battery SoC
+            icon: mdi:battery
+
+          - type: entity
+            entity: sensor.pv3_battery_power
+            name: Battery Power
+            icon: mdi:battery-charging
+
+          - type: entity
+            entity: sensor.pv3_grid_power
+            name: Grid Power
+            icon: mdi:transmission-tower
+
+          - type: entity
+            entity: sensor.pv3_house_power
+            name: House Load
+            icon: mdi:home-lightning-bolt
+
+      # ---- Schedule status ----
+      - type: horizontal-stack
+        cards:
+          - type: entity
+            entity: sensor.pv3_schedule_event
+            name: Schedule Mode
+            icon: mdi:calendar-clock
+
+          - type: entity
+            entity: sensor.pv3_schedule_setpoint
+            name: Schedule Setpoint
+
+          - type: entity
+            entity: sensor.pv3_eps_reserve
+            name: EPS Reserve
+
+      # ---- Battery detail ----
+      - type: entities
+        title: Battery Status
+        entities:
+          - entity: sensor.pv3_battery_soc
+            name: State of Charge (BMS)
+          - entity: sensor.pv3_battery_capacity
+            name: Capacity (Inverter)
+          - entity: sensor.pv3_battery_voltage
+            name: Voltage
+          - entity: sensor.pv3_battery_current
+            name: Charge Current (Inverter)
+          - entity: sensor.pv3_battery_current_total
+            name: Current Total (BMS)
+          - entity: sensor.pv3_battery_power
+            name: Power (+ discharge / − charge)
+          - entity: sensor.pv3_max_charge_power
+            name: Max Charge Power
+          - entity: sensor.pv3_max_discharge_power
+            name: Max Discharge Power
+
+      # ---- Battery health ----
+      - type: entities
+        title: Battery Health (Pylontech)
+        entities:
+          - entity: sensor.pv3_battery_soh
+            name: State of Health (avg)
+          - entity: sensor.pv3_battery_soh_min
+            name: State of Health (min)
+          - entity: sensor.pv3_battery_cycles_avg
+            name: Cycle Count (avg)
+          - entity: sensor.pv3_battery_cycles_max
+            name: Cycle Count (max)
+          - entity: sensor.pv3_cell_voltage_max
+            name: Cell Voltage Max
+          - entity: sensor.pv3_cell_voltage_min
+            name: Cell Voltage Min
+          - entity: sensor.pv3_module_voltage_avg
+            name: Module Voltage (avg)
+          - entity: sensor.pv3_charge_voltage_limit
+            name: Charge Voltage Limit
+          - entity: sensor.pv3_discharge_voltage_limit
+            name: Discharge Voltage Limit
+          - entity: sensor.pv3_charge_current_limit
+            name: Charge Current Limit
+          - entity: sensor.pv3_discharge_current_limit
+            name: Discharge Current Limit
+
+      # ---- Temperatures ----
+      - type: entities
+        title: Temperatures
+        entities:
+          - entity: sensor.pv3_cell_temp_avg
+            name: Cell Temp (avg)
+          - entity: sensor.pv3_cell_temp_max
+            name: Cell Temp (max)
+          - entity: sensor.pv3_cell_temp_min
+            name: Cell Temp (min)
+          - entity: sensor.pv3_bms_temp_avg
+            name: BMS Temp (avg)
+          - entity: sensor.pv3_inverter_temperature
+            name: Inverter Temp
+          - entity: sensor.pv3_boost_temperature
+            name: Boost Temp
+          - entity: sensor.pv3_inner_temperature
+            name: Inner Temp
+
+      # ---- Grid ----
+      - type: entities
+        title: Grid
+        entities:
+          - entity: sensor.pv3_grid_voltage
+            name: Voltage
+          - entity: sensor.pv3_grid_frequency
+            name: Frequency
+          - entity: sensor.pv3_grid_power
+            name: Grid Power (FFR CT)
+          - entity: sensor.pv3_house_power
+            name: House Load (FFR CT)
+          - entity: sensor.pv3_aux1_power
+            name: AUX1 Power (FFR CT)
+
+      # ---- Alarms ----
+      - type: entities
+        title: Alarms & Status
+        entities:
+          - entity: sensor.pv3_active_alarms
+            name: Active Alarms
+          - entity: sensor.pv3_warnings_summary
+            name: Warnings Summary
+          - entity: sensor.pv3_alarm_battery_low
+            name: Battery Low
+          - entity: sensor.pv3_alarm_overload
+            name: Overload
+          - entity: sensor.pv3_alarm_over_temperature
+            name: Over Temperature
+          - entity: sensor.pv3_alarm_grid_voltage_oor
+            name: Grid Voltage OOR
+          - entity: sensor.pv3_alarm_grid_freq_oor
+            name: Grid Frequency OOR
+
+  # ---- History view ----
+  - title: History
+    path: pv3-history
+    icon: mdi:chart-line
+    cards:
+      - type: history-graph
+        title: Power Flow (24h)
+        hours_to_show: 24
+        entities:
+          - entity: sensor.pv3_battery_power
+            name: Battery
+          - entity: sensor.pv3_grid_power
+            name: Grid
+          - entity: sensor.pv3_house_power
+            name: House
+
+      - type: history-graph
+        title: Battery State of Charge (7 days)
+        hours_to_show: 168
+        entities:
+          - entity: sensor.pv3_battery_soc
+            name: SoC
+
+      - type: history-graph
+        title: Battery Health
+        hours_to_show: 720
+        entities:
+          - entity: sensor.pv3_battery_soh
+            name: SOH
+          - entity: sensor.pv3_cell_temp_avg
+            name: Cell Temp
