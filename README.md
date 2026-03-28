@@ -422,46 +422,45 @@ The same Docker image used by the controller also contains `poll.py`.  This is
 the easiest way to test hardware on the Pi without installing Python or any
 dependencies on the host.
 
-**Prerequisites:** your `.env` file is present and `BATTERY_PORT` /
-`INVERTER_PORT` / `PV_INVERTER_PORT` are set to the correct `/dev` paths.
-
 ```bash
 # Build the image (if not already built)
 docker compose build
 
-# Poll the battery only — passes /dev/ttyUSB1 into the container
-docker compose run --rm poll --battery /dev/ttyUSB1
+# Poll the battery only
+docker compose run --rm --device /dev/ttyUSB1:/dev/ttyUSB1 poll --battery /dev/ttyUSB1
 
 # Poll the inverter only
-docker compose run --rm poll --inverter /dev/ttyUSB0
+docker compose run --rm --device /dev/ttyUSB0:/dev/ttyUSB0 poll --inverter /dev/ttyUSB0
 
 # Poll all three at once
-docker compose run --rm poll \
+docker compose run --rm \
+    --device /dev/ttyUSB0:/dev/ttyUSB0 \
+    --device /dev/ttyUSB1:/dev/ttyUSB1 \
+    --device /dev/ttyUSB2:/dev/ttyUSB2 \
+    poll \
     --battery  /dev/ttyUSB1 \
     --inverter /dev/ttyUSB0 \
     --pv       /dev/ttyUSB2
 
 # Repeat every 10 seconds
-docker compose run --rm poll --battery /dev/ttyUSB1 --interval 10
+docker compose run --rm --device /dev/ttyUSB1:/dev/ttyUSB1 poll --battery /dev/ttyUSB1 --interval 10
 
 # JSON output (useful for piping into jq)
-docker compose run --rm poll --battery /dev/ttyUSB1 --json | jq .
+docker compose run --rm --device /dev/ttyUSB1:/dev/ttyUSB1 poll --battery /dev/ttyUSB1 --json | jq .
 
 # Show all available flags
 docker compose run --rm poll --help
 ```
 
-> **How the device paths get into the container:**  
-> `docker-compose.yml` passes the `INVERTER_PORT` and `BATTERY_PORT` values
-> from your `.env` file as `devices:` entries.  If you want to pass a port that
-> isn't in `.env` (e.g. the PV inverter), either add it to `.env` and
-> uncomment the `PV_INVERTER_PORT` device line in `docker-compose.yml`, or use
-> `docker run` directly (see below).
+> **How device paths work:** `poll.py` accepts port paths as CLI arguments.
+> Use `--device HOST_PATH:CONTAINER_PATH` on the `docker compose run` command
+> to pass through only the specific port(s) you need.  Keep both sides of the
+> colon identical (e.g. `/dev/ttyUSB1:/dev/ttyUSB1`) so the path you pass to
+> `--battery` / `--inverter` / `--pv` matches what exists inside the container.
 
 #### Using `docker run` directly (without docker-compose)
 
-If you prefer not to use Compose, or need a port that isn't wired into the
-`poll` service's `devices:` block, use `docker run` with `--device`:
+If you prefer not to use Compose, use `docker run` with `--device`:
 
 ```bash
 # Build the image
