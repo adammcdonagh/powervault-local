@@ -92,6 +92,15 @@ cp .env.example .env
 nano .env   # fill in your settings (see Configuration reference below)
 ```
 
+Every setting in `.env.example` is documented with inline comments.  The
+minimum you must change before first run:
+
+| Variable | What to set |
+|----------|-------------|
+| `HA_MQTT_HOST` | IP address of your Home Assistant Mosquitto broker |
+| `INVERTER_PORT` | Serial/USB device for the Iconica inverter (see [Discovering USB device paths](#discovering-usb-device-paths) below) |
+| `BATTERY_PORT` | Serial/USB device for the Pylontech battery RS485 adapter |
+
 ### 3. Run
 
 **Direct (Python 3.10+):**
@@ -101,14 +110,22 @@ pip install -r requirements.txt
 python -m controller.main
 ```
 
-**Docker:**
+**Docker (recommended on the Raspberry Pi):**
 
 ```bash
-docker-compose up -d
+# Build the image and start the controller in the background.
+# Reads .env automatically for all configuration.
+docker compose up -d
+
+# Follow logs
+docker compose logs -f controller
+
+# Stop
+docker compose down
 ```
 
-On first run the controller publishes MQTT auto-discovery payloads, so all
-entities appear in Home Assistant automatically — no manual YAML needed.
+The controller publishes MQTT auto-discovery payloads on first run, so all
+Home Assistant entities appear automatically — no manual YAML needed.
 
 ---
 
@@ -312,52 +329,174 @@ charge/discharge control:
 
 ---
 
+## Discovering USB device paths
+
+Before running anything you need to know which `/dev` path each USB adapter
+has been assigned.
+
+### On the Raspberry Pi (Linux)
+
+```bash
+# List all USB serial adapters
+ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
+
+# More detail — shows the USB vendor/product ID and which physical port it's in
+ls -l /dev/serial/by-id/
+
+# Confirm a device is responding (press Ctrl-C after a few seconds)
+# Replace /dev/ttyUSB0 with your actual path
+stty -F /dev/ttyUSB0 115200 && cat /dev/ttyUSB0
+```
+
+A typical mapping (in order of plug-in):
+
+| Adapter | Typical path |
+|---------|-------------|
+| Iconica inverter (RS-232) | `/dev/ttyUSB0` |
+| Pylontech RS485 | `/dev/ttyUSB1` |
+| ABB Aurora RS485 | `/dev/ttyUSB2` |
+| Iconica inverter (USB HID front panel) | `/dev/hidraw0` |
+
+> **Tip:** The paths can shift if adapters are plugged/unplugged in a different
+> order.  Use the stable symlinks under `/dev/serial/by-id/` in your `.env`
+> file to avoid surprises after a reboot.
+
+### On macOS
+
+```bash
+# List USB serial ports
+ls /dev/tty.usb*
+
+# Example output:
+#   /dev/tty.usbserial-0001
+#   /dev/tty.usbserial-0002
+```
+
+Adapters appear as `/dev/tty.usbserial-XXXX` (CP2102/CH340) or
+`/dev/tty.usbmodem*` (FTDI).
+
+---
+
 ## Hardware poll utility (`poll.py`)
 
 `poll.py` is a standalone CLI tool for testing your hardware connections without
 running the full controller.  It uses the same drivers as the controller and
-prints a formatted summary of readings — useful when connecting USB adapters to
-a laptop or Mac for the first time.
+prints a formatted summary of readings.
 
-**Install dependencies first:**
+### Running directly (Python 3.10+)
 
 ```bash
 pip install -r requirements.txt
-```
 
-**Usage — poll any combination of components:**
-
-```bash
 # Pylontech batteries only
-python poll.py --battery /dev/tty.usbserial-0001
+python poll.py --battery /dev/ttyUSB1
 
 # Iconica inverter only (RS-232 / USB-serial adapter)
-python poll.py --inverter /dev/tty.usbserial-0002
+python poll.py --inverter /dev/ttyUSB0
 
 # Iconica inverter via the USB HID port on the front panel
 python poll.py --inverter /dev/hidraw0 --inverter-usb
 
 # ABB Aurora PV inverter only
-python poll.py --pv /dev/tty.usbserial-0003
+python poll.py --pv /dev/ttyUSB2
 
 # All three at once
 python poll.py \
-    --battery  /dev/tty.usbserial-0001 \
-    --inverter /dev/tty.usbserial-0002 \
-    --pv       /dev/tty.usbserial-0003
+    --battery  /dev/ttyUSB1 \
+    --inverter /dev/ttyUSB0 \
+    --pv       /dev/ttyUSB2
 
 # Poll every 10 seconds (Ctrl-C to stop)
-python poll.py --battery /dev/tty.usbserial-0001 --interval 10
+python poll.py --battery /dev/ttyUSB1 --interval 10
 
 # Machine-readable JSON output
-python poll.py --battery /dev/tty.usbserial-0001 --json
+python poll.py --battery /dev/ttyUSB1 --json
 ```
 
-On macOS, USB-serial adapters typically appear as `/dev/tty.usbserial-*` or
-`/dev/tty.usbmodem*`.  Run `ls /dev/tty.usb*` to find yours.  On Linux they
-appear as `/dev/ttyUSB0`, `/dev/ttyUSB1`, etc.
+On macOS, replace `/dev/ttyUSBx` with your adapter path (e.g.
+`/dev/tty.usbserial-0001`).  See [Discovering USB device paths](#discovering-usb-device-paths) above.
 
-**All options:**
+### Running via Docker (Raspberry Pi)
+
+The same Docker image used by the controller also contains `poll.py`.  This is
+the easiest way to test hardware on the Pi without installing Python or any
+dependencies on the host.
+
+**Prerequisites:** your `.env` file is present and `BATTERY_PORT` /
+`INVERTER_PORT` / `PV_INVERTER_PORT` are set to the correct `/dev` paths.
+
+```bash
+# Build the image (if not already built)
+docker compose build
+
+# Poll the battery only — passes /dev/ttyUSB1 into the container
+docker compose run --rm poll --battery /dev/ttyUSB1
+
+# Poll the inverter only
+docker compose run --rm poll --inverter /dev/ttyUSB0
+
+# Poll all three at once
+docker compose run --rm poll \
+    --battery  /dev/ttyUSB1 \
+    --inverter /dev/ttyUSB0 \
+    --pv       /dev/ttyUSB2
+
+# Repeat every 10 seconds
+docker compose run --rm poll --battery /dev/ttyUSB1 --interval 10
+
+# JSON output (useful for piping into jq)
+docker compose run --rm poll --battery /dev/ttyUSB1 --json | jq .
+
+# Show all available flags
+docker compose run --rm poll --help
+```
+
+> **How the device paths get into the container:**  
+> `docker-compose.yml` passes the `INVERTER_PORT` and `BATTERY_PORT` values
+> from your `.env` file as `devices:` entries.  If you want to pass a port that
+> isn't in `.env` (e.g. the PV inverter), either add it to `.env` and
+> uncomment the `PV_INVERTER_PORT` device line in `docker-compose.yml`, or use
+> `docker run` directly (see below).
+
+#### Using `docker run` directly (without docker-compose)
+
+If you prefer not to use Compose, or need a port that isn't wired into the
+`poll` service's `devices:` block, use `docker run` with `--device`:
+
+```bash
+# Build the image
+docker build -t powervault-local .
+
+# Single USB adapter (battery RS485)
+docker run --rm -it \
+    --device /dev/ttyUSB1:/dev/ttyUSB1 \
+    powervault-local \
+    python poll.py --battery /dev/ttyUSB1
+
+# All three adapters
+docker run --rm -it \
+    --device /dev/ttyUSB0:/dev/ttyUSB0 \
+    --device /dev/ttyUSB1:/dev/ttyUSB1 \
+    --device /dev/ttyUSB2:/dev/ttyUSB2 \
+    powervault-local \
+    python poll.py \
+        --battery  /dev/ttyUSB1 \
+        --inverter /dev/ttyUSB0 \
+        --pv       /dev/ttyUSB2
+
+# Inverter front-panel USB HID port
+docker run --rm -it \
+    --device /dev/hidraw0:/dev/hidraw0 \
+    powervault-local \
+    python poll.py --inverter /dev/hidraw0 --inverter-usb
+```
+
+> **Note:** The path after the colon (`:/dev/ttyUSB1`) is the path *inside* the
+> container — it must match the `--battery` / `--inverter` / `--pv` argument
+> you pass to `poll.py`.  Keeping both sides identical (as above) avoids
+> confusion.
+
+### All options
 
 | Flag | Default | Description |
 |------|---------|-------------|

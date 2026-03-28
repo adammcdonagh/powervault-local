@@ -39,3 +39,39 @@ services:
       PEAK_SHAVE_HYSTERESIS_W: ${PEAK_SHAVE_HYSTERESIS_W:-50}
       PEAK_SHAVE_MIN_APPLY_INTERVAL: ${PEAK_SHAVE_MIN_APPLY_INTERVAL:-2}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+  # ---------------------------------------------------------------------------
+  # poll — one-shot hardware poll utility.
+  #
+  # Only started explicitly (it is NOT included in `docker-compose up -d`).
+  # Usage:
+  #   docker compose run --rm poll --battery /dev/ttyUSB1
+  #   docker compose run --rm poll --inverter /dev/ttyUSB0
+  #   docker compose run --rm poll --pv /dev/ttyUSB2
+  #   docker compose run --rm poll --battery /dev/ttyUSB1 --inverter /dev/ttyUSB0 --pv /dev/ttyUSB2
+  #   docker compose run --rm poll --battery /dev/ttyUSB1 --interval 10   # repeat every 10 s
+  #   docker compose run --rm poll --battery /dev/ttyUSB1 --json           # JSON output
+  #
+  # The devices block below passes through the three USB adapters.  Add or
+  # remove entries to match whichever ports you have plugged in.
+  # ---------------------------------------------------------------------------
+  poll:
+    build: .
+    profiles: ["poll"]
+    entrypoint: ["python", "poll.py"]
+    # Default args — override on the command line (everything after `poll` in
+    # `docker compose run --rm poll <args>` is appended to the entrypoint).
+    # Passing no extra args will show the --help text.
+    command: ["--help"]
+    devices:
+      - ${INVERTER_PORT:-/dev/ttyUSB0}:${INVERTER_PORT:-/dev/ttyUSB0}
+      - ${BATTERY_PORT:-/dev/ttyUSB1}:${BATTERY_PORT:-/dev/ttyUSB1}
+      # Uncomment when the ABB PV inverter is connected:
+      # - ${PV_INVERTER_PORT:-/dev/ttyUSB2}:${PV_INVERTER_PORT:-/dev/ttyUSB2}
+    environment:
+      # Not used by poll.py directly but makes it easy to read the env file
+      # and see which ports are configured.
+      INVERTER_PORT: ${INVERTER_PORT:-/dev/ttyUSB0}
+      BATTERY_PORT: ${BATTERY_PORT:-/dev/ttyUSB1}
+      PV_INVERTER_PORT: ${PV_INVERTER_PORT:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
