@@ -1,4 +1,5 @@
 services:
+  # --- Legacy M4-dependent MQTT bridge (keep while M4 is still running) ---
   pv3_bridge:
     build: .
     container_name: pv3_bridge
@@ -19,3 +20,41 @@ services:
     volumes:
       # Mount SSH key if using key-based auth for schedule control
       - ${M4_SSH_KEY_FILE:-/dev/null}:${M4_SSH_KEY_FILE:-/dev/null}:ro
+
+  # --- M4-bypass standalone controller (replaces the bridge entirely) ---
+  # Disable pv3_bridge and enable this service once direct hardware wiring
+  # is in place (USB → inverter, RS485 → batteries, RS485 → ABB PV inverter).
+  controller:
+    build: .
+    container_name: powervault_controller
+    restart: unless-stopped
+    command: ["python", "-m", "controller.main"]
+    # Expose serial/USB ports. Adjust device paths to match your system.
+    # Check with: ls /dev/ttyUSB* /dev/hidraw*
+    devices:
+      - ${INVERTER_PORT:-/dev/ttyUSB0}:${INVERTER_PORT:-/dev/ttyUSB0}
+      - ${BATTERY_PORT:-/dev/ttyUSB1}:${BATTERY_PORT:-/dev/ttyUSB1}
+      # Uncomment when ABB PV inverter is wired:
+      # - ${PV_INVERTER_PORT:-/dev/ttyUSB2}:${PV_INVERTER_PORT:-/dev/ttyUSB2}
+    environment:
+      DEVICE_ID: ${DEVICE_ID:-powervault}
+      INVERTER_PORT: ${INVERTER_PORT:-/dev/ttyUSB0}
+      INVERTER_IS_USB: ${INVERTER_IS_USB:-false}
+      BATTERY_PORT: ${BATTERY_PORT:-/dev/ttyUSB1}
+      NUM_BATTERY_MODULES: ${NUM_BATTERY_MODULES:-1}
+      PV_INVERTER_PORT: ${PV_INVERTER_PORT:-}
+      PV_INVERTER_ADDRESS: ${PV_INVERTER_ADDRESS:-2}
+      POLL_INTERVAL: ${POLL_INTERVAL:-30}
+      CHEAP_START: ${CHEAP_START:-00:30}
+      CHEAP_END: ${CHEAP_END:-04:30}
+      CHARGE_TARGET: ${CHARGE_TARGET:-90}
+      MIN_SOC: ${MIN_SOC:-15}
+      HA_MQTT_HOST: ${HA_MQTT_HOST:-}
+      HA_MQTT_PORT: ${HA_MQTT_PORT:-1883}
+      HA_MQTT_USER: ${HA_MQTT_USER:-}
+      HA_MQTT_PASS: ${HA_MQTT_PASS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    profiles:
+      # Run with: docker-compose --profile controller up
+      # This keeps the service dormant until explicitly requested.
+      - controller
